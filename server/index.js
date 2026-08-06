@@ -19,6 +19,7 @@ const OTP_RESEND_COOLDOWN = 60 * 1000
 const UPSTREAM_TIMEOUT = 90 * 1000
 const ALLOWED_LIMITS = new Set([100000, 500000, 1000000])
 const TIER_MODELS = { free: 'Normal Chat', premium: 'Premium' }
+const PUBLIC_MODEL = 'SwitchForge'
 
 const requiredConfig = ['GMAIL_USER', 'GMAIL_APP_PASSWORD', 'OMNIROUTE_BASE_URL', 'OMNIROUTE_API_KEY']
 if (STORAGE_BACKEND === 'r2') requiredConfig.push('R2_ENDPOINT', 'R2_BUCKET', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY')
@@ -249,7 +250,7 @@ function customerKey(req, res, next) {
   req.apiKey = key; next()
 }
 
-app.get('/v1/models', customerKey, (_req, res) => res.json({ object: 'list', data: [{ id: 'DTEmpire', object: 'model', owned_by: 'dtempire' }] }))
+app.get('/v1/models', customerKey, (_req, res) => res.json({ object: 'list', data: [{ id: PUBLIC_MODEL, object: 'model', owned_by: 'dtempire' }, { id: 'DTEmpire', object: 'model', owned_by: 'dtempire', deprecated: true }] }))
 app.get('/v1/usage', customerKey, (req, res) => res.json({ token_used: req.apiKey.tokenUsed, token_limit: req.apiKey.tokenLimit, remaining: Math.max(0, req.apiKey.tokenLimit - req.apiKey.tokenUsed), expires_at: req.apiKey.expiresAt }))
 app.post('/v1/chat/completions', customerKey, async (req, res) => {
   try {
@@ -271,7 +272,7 @@ app.post('/v1/chat/completions', customerKey, async (req, res) => {
     }
     const data = await readChatResponse(upstream), used = Number(data.usage?.total_tokens || estimateTokens(payload.messages) + estimateTokens(data.choices?.[0]?.message?.content || ''))
     req.apiKey.tokenUsed += used; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, tokens: used, createdAt: new Date().toISOString() }); await saveDb()
-    data.model = 'DTEmpire'; data.dtempire = { tier, model: TIER_MODELS[tier], requested_tier: requestedTier }; res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', TIER_MODELS[tier]); res.json(data)
+    data.model = PUBLIC_MODEL; data.switchforge = { tier, model: TIER_MODELS[tier], requested_tier: requestedTier }; data.dtempire = data.switchforge; res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', TIER_MODELS[tier]); res.json(data)
   } catch (error) { console.error(error); res.status(502).json({ error: { message: 'OmniRoute is unavailable.', type: 'upstream_error' } }) }
 })
 

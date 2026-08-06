@@ -43,7 +43,7 @@ function Auth({ onAuthed, onDocs }) {
   const curlExample = `curl ${gatewayBase}/v1/chat/completions \\
   -H "Authorization: Bearer $DT_API_KEY" \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"DTEmpire","tier":"free","messages":[{"role":"user","content":"Hello"}]}'`
+  -d '{"model":"SwitchForge","tier":"free","messages":[{"role":"user","content":"Hello"}]}'`
   const switchMode = next => { setDirection(next === 'login' ? 'left' : 'right'); setMode(next); setStep('form'); setError('') }
   const runDemo = async e => {
     e.preventDefault(); if (!demoMessage.trim() || demoLoading) return
@@ -89,7 +89,7 @@ function Auth({ onAuthed, onDocs }) {
         </div>
         <div className="code-card"><div className="code-head"><i/><i/><i/><span>QUICK START</span><button title="Copy curl command" onClick={()=>navigator.clipboard?.writeText(curlExample)}><Copy/></button></div><pre><span>curl</span> {gatewayBase}/v1/chat/completions \
   -H <b>"Authorization: Bearer $DT_API_KEY"</b> \
-  -d <b>'&#123;"model": "DTEmpire", "tier": "free"&#125;'</b></pre></div>
+  -d <b>'&#123;"model": "SwitchForge", "tier": "free"&#125;'</b></pre></div>
         <div className="demo-chat"><div className="demo-chat-head"><span><i/>LIVE GATEWAY DEMO</span><small>FREE ROUTE</small></div><div className="demo-response"><Sparkles/><p>{demoReply}</p></div><form onSubmit={runDemo}><input maxLength="240" value={demoMessage} onChange={e=>setDemoMessage(e.target.value)} placeholder="Ask a short question..."/><button disabled={!demoMessage.trim()||demoLoading} title="Send message"><ArrowRight/></button></form></div>
       </div>
       <div className={`auth-card auth-slide-${direction}`} key={`${mode}-${step}`}>
@@ -130,7 +130,7 @@ function Documentation({ onClose }) {
   const [active,setActive]=useState('intro')
   useEffect(()=>{const root=document.querySelector('.docs-overlay');const observer=new IntersectionObserver(entries=>{const visible=entries.filter(e=>e.isIntersecting).sort((a,b)=>a.boundingClientRect.top-b.boundingClientRect.top)[0];if(visible)setActive(visible.target.id)},{root,rootMargin:'-15% 0px -65%',threshold:0});sections.forEach(([id])=>{const el=document.getElementById(id);if(el)observer.observe(el)});return()=>observer.disconnect()},[])
   return <div className="docs-overlay"><header><Brand/><button className="modal-close" onClick={onClose}><X/></button></header><div className="docs-layout"><aside><small>GET STARTED</small>{sections.map(([id,label])=><a key={id} className={active===id?'current':''} href={`#${id}`}>{label}</a>)}</aside><article>
-    <div className="docs-eyebrow">SWITCHFORGE BY DTEMPIRE / DOCUMENTATION</div><h1 id="intro">Build once. Route intelligently.</h1><p className="docs-lead">SwitchForge exposes one OpenAI-compatible chat endpoint backed by OmniRoute. Your application uses the stable public model name <code>DTEmpire</code> while the gateway handles the underlying route.</p>
+    <div className="docs-eyebrow">SWITCHFORGE BY DTEMPIRE / DOCUMENTATION</div><h1 id="intro">Build once. Route intelligently.</h1><p className="docs-lead">SwitchForge exposes one OpenAI-compatible chat endpoint backed by OmniRoute. Your application uses the stable public model name <code>SwitchForge</code> while the gateway handles the underlying route.</p>
     <div className="docs-callout"><Sparkles/><div><b>Early access</b><p>The service is free while we test and help developers learn how model gateways work. Future subscriptions may support infrastructure and premium model access as the platform matures.</p></div></div>
     <h2 id="walkthrough-doc">Start-to-finish walkthrough</h2><div className="docs-steps"><div><b>1</b><span><strong>Create an account</strong>Enter your name, Gmail address, and password. SwitchForge emails a six-digit OTP that expires after 10 minutes.</span></div><div><b>2</b><span><strong>Verify and sign in</strong>Enter the OTP to open the developer console. Future visits use your email and password.</span></div><div><b>3</b><span><strong>Create a key</strong>Select <em>Create API key</em>, give it a recognizable name, choose its expiry and token allowance, then copy the secret immediately.</span></div><div><b>4</b><span><strong>Send a request</strong>Put the secret in the Bearer authorization header and choose either the free or premium tier.</span></div><div><b>5</b><span><strong>Monitor and rotate</strong>Check usage with the usage endpoint. Create a replacement before expiry and revoke keys you no longer use.</span></div></div>
     <h2 id="auth-doc">Create and store an API key</h2><p>From the console, select <strong>Create API key</strong>. Choose a name, an expiry of one, two, or three months, and an allowance of 100K, 500K, or 1M tokens. The full <code>dt_live_...</code> secret is displayed only once. Store it in a server-side environment variable and never place it in browser code or commit it to Git.</p><pre><span>export</span> DT_API_KEY=<b>"dt_live_YOUR_KEY"</b></pre>
@@ -138,7 +138,7 @@ function Documentation({ onClose }) {
   -H <b>"Authorization: Bearer dt_live_YOUR_KEY"</b> \
   -H <b>"Content-Type: application/json"</b> \
   -d <b>'&#123;
-    "model": "DTEmpire",
+    "model": "SwitchForge",
     "tier": "free",
     "messages": [&#123;"role":"user","content":"Hello"&#125;]
   &#125;'</b></pre>
@@ -146,7 +146,7 @@ function Documentation({ onClose }) {
     <h2 id="limits-doc">Limits and expiry</h2><p>Limits are configured separately for every key and enforced by the backend before a request is sent upstream.</p><div className="limit-table"><div><b>Token allowances</b><span>100K, 500K, or 1M tokens per key</span></div><div><b>Expiry choices</b><span>1, 2, or 3 months from creation</span></div><div><b>Active keys</b><span>Maximum of 3 per account</span></div><div><b>Allowance exhausted</b><span>Requests return HTTP 429 until you use another key</span></div><div><b>Key expired</b><span>Requests return HTTP 401; create a replacement key</span></div></div><p>The console shows tokens used, the selected allowance, expiry date, and current status. Usage is recorded after successful responses. Streaming requests use an estimated token count.</p>
     <h2 id="usage-doc">Check usage and rotate keys</h2><p>Use the same API key to read its current allowance, consumption, remaining tokens, and expiry timestamp.</p><pre><span>curl</span> {gatewayBase}/v1/usage \
   -H <b>"Authorization: Bearer $DT_API_KEY"</b></pre><p>Create a new key before the old one expires, update your application environment variable, confirm requests work, and then revoke the old key from the console. Revoke immediately if a secret is exposed.</p>
-    <h2>Endpoints</h2><div className="endpoint-list"><code>POST /v1/chat/completions</code><span>Create a chat completion</span><code>GET /v1/models</code><span>List the DTEmpire model</span><code>GET /v1/usage</code><span>Read usage for the current key</span></div>
+    <h2>Endpoints</h2><div className="endpoint-list"><code>POST /v1/chat/completions</code><span>Create a chat completion</span><code>GET /v1/models</code><span>List the SwitchForge model</span><code>GET /v1/usage</code><span>Read usage for the current key</span></div>
     <footer className="docs-footer">&copy; {new Date().getFullYear()} DargoTamber (DTEmpire). SwitchForge.</footer>
   </article><nav className="docs-rail" aria-label="Current documentation section"><i/>{sections.map(([id,label])=><a key={id} className={active===id?'current':''} href={`#${id}`}><span/>{label}</a>)}</nav></div></div>
 }
@@ -192,7 +192,7 @@ function Dashboard({ user, onLogout, onDocs }) {
           <div className="stat-card"><div className="stat-top"><span className="stat-icon green"><CheckCircle2/></span><small>SUCCESS RATE</small></div><strong>99.8%</strong><p><b>↑ 0.4%</b> from last month</p></div>
           <div className="stat-card"><div className="stat-top"><span className="stat-icon orange"><Clock3/></span><small>AVG. LATENCY</small></div><strong>642<em>ms</em></strong><p>Across 1,284 requests</p></div>
         </section>
-        <section className="endpoint-card"><div className="endpoint-copy"><span className="model-icon"><Sparkles/></span><div><small>YOUR ENDPOINT</small><h3>Chat Completions API</h3><p>Use tier “free” for normal chat or “premium” for complex work.</p></div></div><div className="endpoint-values"><div><small>ENDPOINT</small><code>{`${gatewayBase}/v1/chat/completions`}</code><button onClick={()=>copy(`${gatewayBase}/v1/chat/completions`)}><Copy/></button></div><div><small>MODEL</small><code>DTEmpire</code><button onClick={()=>copy('DTEmpire')}><Copy/></button></div></div></section>
+        <section className="endpoint-card"><div className="endpoint-copy"><span className="model-icon"><Sparkles/></span><div><small>YOUR ENDPOINT</small><h3>Chat Completions API</h3><p>Use tier “free” for normal chat or “premium” for complex work.</p></div></div><div className="endpoint-values"><div><small>ENDPOINT</small><code>{`${gatewayBase}/v1/chat/completions`}</code><button onClick={()=>copy(`${gatewayBase}/v1/chat/completions`)}><Copy/></button></div><div><small>MODEL</small><code>SwitchForge</code><button onClick={()=>copy('SwitchForge')}><Copy/></button></div></div></section>
         <section className="keys-section"><div className="section-head"><div><h2>API keys</h2><p>Manage keys and monitor token usage.</p></div><button className="secondary-btn" onClick={()=>keys.length<3?setModal(true):setToast('Maximum of 3 API keys reached')}><Plus/>New key</button></div>
           <div className="table-wrap"><table><thead><tr><th>NAME</th><th>SECRET KEY</th><th>TOKEN USAGE</th><th>EXPIRES</th><th>STATUS</th><th/></tr></thead><tbody>{keys.map(key=><tr key={key.id}><td><div className="key-name"><span><KeyRound/></span><div><b>{key.name}</b><small>Created {dateFmt(key.createdAt)}</small></div></div></td><td><div className="secret"><code>{key.prefix}••••••••••••{key.lastFour}</code></div></td><td><div className="usage"><span>{fmt(key.tokenUsed)} <small>/ {fmt(key.tokenLimit)}</small></span><div><i style={{width:`${Math.min(100,key.tokenUsed/key.tokenLimit*100)}%`}}/></div></div></td><td><span className="expiry"><Clock3/>{dateFmt(key.expiresAt)}</span></td><td><span className="active-pill"><i/>{key.status}</span></td><td><button className="icon-btn danger" onClick={()=>revoke(key)}><Trash2/></button></td></tr>)}</tbody></table>{!loading&&keys.length===0&&<div className="empty">No API keys yet. Create one to get started.</div>}{loading&&<div className="empty">Loading API keys...</div>}</div>
         </section>
