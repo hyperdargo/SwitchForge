@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import {
   ArrowRight, BarChart3, BookOpen, Check, CheckCircle2, ChevronDown,
   Clock3, Copy, Eye, EyeOff, KeyRound, Layers3, LogOut, Menu, Plus,
-  RotateCcw, Search, Settings, ShieldCheck, Sparkles, Trash2, X, Zap
+  RotateCcw, Save, Search, ServerCog, Settings, ShieldCheck, Sparkles, Trash2, X, Zap
 } from 'lucide-react'
 import './styles.css'
 
@@ -39,6 +39,7 @@ function Auth({ onAuthed, onDocs }) {
   const [direction, setDirection] = useState('right')
   const [demoMessage, setDemoMessage] = useState('')
   const [demoReply, setDemoReply] = useState('Ask SwitchForge a short question to see the gateway respond.')
+  const [demoTier, setDemoTier] = useState('free')
   const [demoLoading, setDemoLoading] = useState(false)
   const curlExample = `curl ${gatewayBase}/v1/chat/completions \\
   -H "Authorization: Bearer $DT_API_KEY" \\
@@ -48,7 +49,7 @@ function Auth({ onAuthed, onDocs }) {
   const runDemo = async e => {
     e.preventDefault(); if (!demoMessage.trim() || demoLoading) return
     setDemoLoading(true); setDemoReply('Thinking...')
-    try { const data = await api('/demo/chat', { method: 'POST', body: JSON.stringify({ message: demoMessage.trim() }) }); setDemoReply(data.reply) }
+    try { const data = await api('/demo/chat', { method: 'POST', body: JSON.stringify({ message: demoMessage.trim() }) }); setDemoReply(data.reply); setDemoTier(data.tier || 'free') }
     catch (err) { setDemoReply(err.message) } finally { setDemoLoading(false) }
   }
 
@@ -90,7 +91,7 @@ function Auth({ onAuthed, onDocs }) {
         <div className="code-card"><div className="code-head"><i/><i/><i/><span>QUICK START</span><button title="Copy curl command" onClick={()=>navigator.clipboard?.writeText(curlExample)}><Copy/></button></div><pre><span>curl</span> {gatewayBase}/v1/chat/completions \
   -H <b>"Authorization: Bearer $DT_API_KEY"</b> \
   -d <b>'&#123;"model": "SwitchForge", "tier": "free"&#125;'</b></pre></div>
-        <div className="demo-chat"><div className="demo-chat-head"><span><i/>LIVE GATEWAY DEMO</span><small>FREE ROUTE</small></div><div className="demo-response"><Sparkles/><p>{demoReply}</p></div><form onSubmit={runDemo}><input maxLength="240" value={demoMessage} onChange={e=>setDemoMessage(e.target.value)} placeholder="Ask a short question..."/><button disabled={!demoMessage.trim()||demoLoading} title="Send message"><ArrowRight/></button></form></div>
+        <div className="demo-chat"><div className="demo-chat-head"><span><i/>LIVE GATEWAY DEMO</span><small className={demoTier==='premium'?'premium-route':''}>{demoTier.toUpperCase()} ROUTE</small></div><div className="demo-response"><Sparkles/><p>{demoReply}</p></div><form onSubmit={runDemo}><input maxLength="240" value={demoMessage} onChange={e=>setDemoMessage(e.target.value)} placeholder="Ask a short question..."/><button disabled={!demoMessage.trim()||demoLoading} title="Send message"><ArrowRight/></button></form></div>
       </div>
       <div className={`auth-card auth-slide-${direction}`} key={`${mode}-${step}`}>
         {step === 'form' ? <>
@@ -165,11 +166,21 @@ function CreateKeyModal({ onClose, onCreate }) {
   </div></div>
 }
 
+function AdminPanel({ onClose }) {
+  const [config,setConfig]=useState(null), [apiKey,setApiKey]=useState(''), [busy,setBusy]=useState(false), [message,setMessage]=useState('')
+  useEffect(()=>{api('/admin/gateway').then(data=>setConfig(data.gateway)).catch(err=>setMessage(err.message))},[])
+  const update=(field,value)=>setConfig(current=>({...current,[field]:value}))
+  const save=async()=>{setBusy(true);setMessage('');try{const data=await api('/admin/gateway',{method:'PUT',body:JSON.stringify({baseUrl:config.baseUrl,freeModel:config.freeModel,premiumModel:config.premiumModel,apiKey})});setConfig(data.gateway);setApiKey('');setMessage('Gateway configuration saved.')}catch(err){setMessage(err.message)}finally{setBusy(false)}}
+  const test=async()=>{setBusy(true);setMessage('');try{const data=await api('/admin/gateway/test',{method:'POST'});setMessage(`Connection successful. ${data.models??'Available'} models detected.`)}catch(err){setMessage(err.message)}finally{setBusy(false)}}
+  return <div className="modal-bg admin-bg"><div className="admin-panel"><header><div><div className="eyebrow"><span/> ADMINISTRATION</div><h2>Gateway control</h2><p>Manage the live OmniRoute connection and routing combos.</p></div><button className="modal-close" onClick={onClose}><X/></button></header>{!config?<div className="admin-loading">Loading gateway configuration...</div>:<div className="admin-form"><div className="admin-status"><ServerCog/><div><b>Active configuration</b><span>{config.source==='admin'?'Managed from this console':'Using server environment defaults'} · API key {config.apiKeyConfigured?'configured':'missing'}</span></div></div><label>OmniRoute base URL<input value={config.baseUrl} onChange={e=>update('baseUrl',e.target.value)} placeholder="https://route.example.com/v1"/></label><div className="admin-combos"><label>Free combo model<input value={config.freeModel} onChange={e=>update('freeModel',e.target.value)} placeholder="Normal Chat"/><small>Used for ordinary conversation and lightweight tasks.</small></label><label>Premium combo model<input value={config.premiumModel} onChange={e=>update('premiumModel',e.target.value)} placeholder="Premium"/><small>Used automatically for coding and technical prompts.</small></label></div><label>Replace OmniRoute API key<input type="password" autoComplete="new-password" value={apiKey} onChange={e=>setApiKey(e.target.value)} placeholder="Leave blank to keep the current key"/></label>{message&&<div className="admin-message">{message}</div>}<div className="admin-actions"><button className="secondary-btn" disabled={busy} onClick={test}><Zap/>Test connection</button><button className="primary-btn" disabled={busy||!config.baseUrl||!config.freeModel||!config.premiumModel} onClick={save}><Save/>{busy?'Working...':'Save configuration'}</button></div></div>}</div></div>
+}
+
 function Dashboard({ user, onLogout, onDocs }) {
   const [keys, setKeys] = useState([])
   const [modal, setModal] = useState(false)
   const [toast, setToast] = useState('')
   const [newSecret, setNewSecret] = useState(null)
+  const [adminOpen, setAdminOpen] = useState(false)
   const [loading, setLoading] = useState(true)
   const total = keys.reduce((a,k)=>a+k.tokenUsed,0)
   useEffect(()=>{if(toast){const t=setTimeout(()=>setToast(''),2600);return()=>clearTimeout(t)}},[toast])
@@ -181,7 +192,7 @@ function Dashboard({ user, onLogout, onDocs }) {
   const copy = text => {navigator.clipboard?.writeText(text);setToast('Copied to clipboard')}
   const revoke = async key => { try { await api(`/keys/${key.id}`, { method: 'DELETE' }); setKeys(keys.filter(k=>k.id!==key.id)); setToast('API key revoked') } catch (err) { setToast(err.message) } }
   return <div className="app-shell">
-    <aside><Brand/><div className="workspace"><div>{user.name.slice(0,2).toUpperCase()}</div><span><small>PERSONAL WORKSPACE</small>{user.name}'s workspace</span><ChevronDown/></div><nav><p>PLATFORM</p><a className="active"><Layers3/>Overview</a><a><KeyRound/>API keys<span>{keys.length}</span></a><a><BarChart3/>Usage</a><p>DEVELOPERS</p><a onClick={onDocs}><BookOpen/>Documentation<ArrowRight/></a><a><Settings/>Settings</a></nav><div className="side-bottom"><div><span className="status-dot"/>All systems operational</div><small>&copy; {new Date().getFullYear()} DargoTamber (DTEmpire)</small><button onClick={onLogout}><LogOut/>Sign out</button></div></aside>
+    <aside><Brand/><div className="workspace"><div>{user.name.slice(0,2).toUpperCase()}</div><span><small>{user.role==='admin'?'ADMIN WORKSPACE':'PERSONAL WORKSPACE'}</small>{user.name}'s workspace</span><ChevronDown/></div><nav><p>PLATFORM</p><a className="active"><Layers3/>Overview</a><a><KeyRound/>API keys<span>{keys.length}</span></a><a><BarChart3/>Usage</a><p>DEVELOPERS</p><a onClick={onDocs}><BookOpen/>Documentation<ArrowRight/></a><a><Settings/>Settings</a>{user.role==='admin'&&<><p>ADMIN</p><a onClick={()=>setAdminOpen(true)}><ServerCog/>Gateway control<ArrowRight/></a></>}</nav><div className="side-bottom"><div><span className="status-dot"/>All systems operational</div><small>&copy; {new Date().getFullYear()} DargoTamber (DTEmpire)</small><button onClick={onLogout}><LogOut/>Sign out</button></div></aside>
     <main className="dashboard">
       <header><button className="mobile-menu"><Menu/></button><div className="search"><Search/><span>Search documentation...</span><kbd>⌘ K</kbd></div><div className="header-right"><button className="docs-btn" onClick={onDocs}><BookOpen/>Docs</button><button className="avatar">{user.name.slice(0,2).toUpperCase()}</button></div></header>
       <div className="dash-body">
@@ -199,7 +210,7 @@ function Dashboard({ user, onLogout, onDocs }) {
         <div className="quick-grid"><div className="quick-card"><div className="q-icon"><BookOpen/></div><div><h3>Make your first request</h3><p>Follow the quickstart and start building in under five minutes.</p><a>Read the quickstart <ArrowRight/></a></div></div><div className="quick-card"><div className="q-icon purple"><RotateCcw/></div><div><h3>Keys expire automatically</h3><p>For security, keys last 1–3 months. Rotate before expiration.</p><a>Learn about key security <ArrowRight/></a></div></div></div>
       </div>
     </main>
-    {modal&&<CreateKeyModal onClose={()=>setModal(false)} onCreate={createKey}/>} {newSecret&&<div className="modal-bg"><div className="modal secret-modal"><button className="modal-close" onClick={()=>setNewSecret(null)}><X/></button><div className="card-icon success"><Check/></div><h2>API key created</h2><p>Copy this key now. For security, it will not be shown again.</p><div className="new-secret"><code>{newSecret}</code><button onClick={()=>copy(newSecret)}><Copy/></button></div><div className="modal-note"><ShieldCheck/>Store this secret somewhere secure. Anyone with it can use your token allowance.</div><button className="primary-btn" onClick={()=>setNewSecret(null)}>I saved my key</button></div></div>} {toast&&<div className="toast"><Check/>{toast}</div>}
+    {modal&&<CreateKeyModal onClose={()=>setModal(false)} onCreate={createKey}/>} {newSecret&&<div className="modal-bg"><div className="modal secret-modal"><button className="modal-close" onClick={()=>setNewSecret(null)}><X/></button><div className="card-icon success"><Check/></div><h2>API key created</h2><p>Copy this key now. For security, it will not be shown again.</p><div className="new-secret"><code>{newSecret}</code><button onClick={()=>copy(newSecret)}><Copy/></button></div><div className="modal-note"><ShieldCheck/>Store this secret somewhere secure. Anyone with it can use your token allowance.</div><button className="primary-btn" onClick={()=>setNewSecret(null)}>I saved my key</button></div></div>} {adminOpen&&<AdminPanel onClose={()=>setAdminOpen(false)}/>} {toast&&<div className="toast"><Check/>{toast}</div>}
   </div>
 }
 

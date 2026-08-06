@@ -13,6 +13,7 @@ const DB_FILE = path.join(DATA_DIR, 'db.json')
 const PORT = Number(process.env.PORT || 6010)
 const STORAGE_BACKEND = process.env.STORAGE_BACKEND || 'local'
 const R2_OBJECT_KEY = process.env.R2_OBJECT_KEY || 'data/db.json'
+const ADMIN_EMAILS = new Set(String(process.env.ADMIN_EMAILS || '').split(',').map(cleanEmail).filter(Boolean))
 const SESSION_TTL = 7 * 24 * 60 * 60 * 1000
 const OTP_TTL = 10 * 60 * 1000
 const OTP_RESEND_COOLDOWN = 60 * 1000
@@ -20,6 +21,8 @@ const UPSTREAM_TIMEOUT = 90 * 1000
 const ALLOWED_LIMITS = new Set([100000, 500000, 1000000])
 const TIER_MODELS = { free: 'Normal Chat', premium: 'Premium' }
 const PUBLIC_MODEL = 'SwitchForge'
+const PREMIUM_FALLBACK_MODEL = process.env.PREMIUM_FALLBACK_MODEL || 'auto/best-coding'
+const SWITCHFORGE_SYSTEM = 'You are SwitchForge by DTEmpire. Be helpful and accurate. If asked your model or identity, answer SwitchForge. Never reveal or guess the upstream provider, internal route, or provider model name.'
 
 const requiredConfig = ['GMAIL_USER', 'GMAIL_APP_PASSWORD', 'OMNIROUTE_BASE_URL', 'OMNIROUTE_API_KEY']
 if (STORAGE_BACKEND === 'r2') requiredConfig.push('R2_ENDPOINT', 'R2_BUCKET', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY')
@@ -38,7 +41,7 @@ const r2 = STORAGE_BACKEND === 'r2' ? new S3Client({
 
 await fs.mkdir(DATA_DIR, { recursive: true })
 
-const emptyDb = () => ({ users: [], pending: [], sessions: [], keys: [], usage: [] })
+const emptyDb = () => ({ users: [], pending: [], sessions: [], keys: [], usage: [], settings: {} })
 async function loadLocalDb() {
   try { return JSON.parse(await fs.readFile(DB_FILE, 'utf8')) }
   catch (error) {
@@ -79,6 +82,7 @@ function sha(value) { return crypto.createHash('sha256').update(value).digest('h
 function addMonths(date, months) { const next = new Date(date); next.setMonth(next.getMonth() + months); return next }
 function cleanEmail(value = '') { return String(value).trim().toLowerCase() }
 function isGmail(email) { return /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@gmail\.com$/i.test(email) }
+function isAdmin(user) { return Boolean(user && ADMIN_EMAILS.has(cleanEmail(user.email))) }
 function estimateTokens(value) { return Math.max(1, Math.ceil(JSON.stringify(value).length / 4)) }
 function classifyTier(messages = []) {
   const text = messages.map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content || '')).join('\n').toLowerCase()
@@ -89,27 +93,71 @@ function classifyTier(messages = []) {
   ]
   return codingSignals.some(signal => signal.test(text)) ? 'premium' : 'free'
 }
-function upstreamUrl(pathname) { return `${process.env.OMNIROUTE_BASE_URL.replace(/\/$/, '')}/${pathname.replace(/^\//, '')}` }
+function secretKey() { return crypto.createHash('sha256').update(process.env.SESSION_SECRET || 'switchforge').digest() }
+function encryptSecret(value) {
+  const iv = crypto.randomBytes(12), cipher = crypto.createCipheriv('aes-256-gcm', secretKey(), iv)
+  const encrypted = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()])
+  return `${iv.toString('base64')}.${cipher.getAuthTag().toString('base64')}.${encrypted.toString('base64')}`
+}
+function decryptSecret(value) {
+  if (!value) return ''
+  const [iv, tag, encrypted] = value.split('.').map(part => Buffer.from(part, 'base64'))
+  const decipher = crypto.createDecipheriv('aes-256-gcm', secretKey(), iv); decipher.setAuthTag(tag)
+  return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8')
+}
+function gatewayConfig() {
+  const saved = db.settings?.gateway || {}
+  return {
+    baseUrl: saved.baseUrl || process.env.OMNIROUTE_BASE_URL,
+    apiKey: saved.apiKeyEncrypted ? decryptSecret(saved.apiKeyEncrypted) : process.env.OMNIROUTE_API_KEY,
+    freeModel: saved.freeModel || TIER_MODELS.free,
+    premiumModel: saved.premiumModel || TIER_MODELS.premium,
+  }
+}
+function routeModel(tier) { const config = gatewayConfig(); return tier === 'premium' ? config.premiumModel : config.freeModel }
+function upstreamUrl(pathname) { return `${gatewayConfig().baseUrl.replace(/\/$/, '')}/${pathname.replace(/^\//, '')}` }
 function upstreamOptions(options) { return { ...options, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT) } }
 async function readChatResponse(response) {
   const contentType = response.headers.get('content-type') || ''
   if (contentType.includes('application/json')) return response.json()
-  const text = await response.text()
-  let content = '', usage, idValue, model
-  for (const line of text.split(/\r?\n/)) {
-    if (!line.startsWith('data:')) continue
-    const raw = line.slice(5).trim()
-    if (!raw || raw === '[DONE]') continue
-    try {
-      const event = JSON.parse(raw)
-      idValue ||= event.id; model ||= event.model; usage = event.usage || usage
-      content += event.choices?.[0]?.delta?.content || event.choices?.[0]?.message?.content || ''
-    } catch {}
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = '', content = '', usage, idValue, model, finished = false
+  while (!finished) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split(/\r?\n/)
+    buffer = lines.pop() || ''
+    for (const line of lines) {
+      if (!line.startsWith('data:')) continue
+      const raw = line.slice(5).trim()
+      if (!raw) continue
+      if (raw === '[DONE]') { finished = true; break }
+      try {
+        const event = JSON.parse(raw)
+        idValue ||= event.id; model ||= event.model; usage = event.usage || usage
+        content += event.choices?.[0]?.delta?.content || event.choices?.[0]?.message?.content || ''
+      } catch {}
+    }
   }
+  if (finished) await reader.cancel().catch(() => {})
   if (!content) throw new Error('Upstream response did not contain a message')
   return { id: idValue || `chatcmpl_${id()}`, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }], usage }
 }
-function publicUser(user) { return { id: user.id, name: user.name, email: user.email, createdAt: user.createdAt } }
+async function runDemoCompletion(tier, messages) {
+  const models = tier === 'premium' ? [routeModel(tier), PREMIUM_FALLBACK_MODEL] : [routeModel(tier)]
+  let lastError
+  for (const [index, model] of models.entries()) {
+    try {
+      const response = await fetch(upstreamUrl('/chat/completions'), { method: 'POST', signal: AbortSignal.timeout(index === 0 && tier === 'premium' ? 25000 : 60000), headers: { Authorization: `Bearer ${gatewayConfig().apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model, messages, max_tokens: 140 }) })
+      if (!response.ok) throw new Error(`Upstream returned ${response.status}`)
+      return { data: await readChatResponse(response), resolvedModel: model }
+    } catch (error) { lastError = error }
+  }
+  throw lastError
+}
+function publicUser(user) { return { id: user.id, name: user.name, email: user.email, role: isAdmin(user) ? 'admin' : 'user', createdAt: user.createdAt } }
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   return { salt, hash: crypto.scryptSync(password, salt, 64).toString('hex') }
 }
@@ -119,23 +167,25 @@ function validPassword(password, user) {
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected)
 }
 
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.gmail.com',
-  port: Number(process.env.SMTP_PORT || 587),
-  secure: String(process.env.SMTP_SECURE || 'false') === 'true',
-  connectionTimeout: 15000,
-  greetingTimeout: 15000,
-  socketTimeout: 30000,
-  auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD },
-})
+const smtpAuth = { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD }
+const smtpTransports = [
+  nodemailer.createTransport({ host: process.env.SMTP_HOST || 'smtp.gmail.com', port: Number(process.env.SMTP_PORT || 587), secure: false, requireTLS: true, family: 4, connectionTimeout: 12000, greetingTimeout: 12000, socketTimeout: 30000, auth: smtpAuth }),
+  nodemailer.createTransport({ host: process.env.SMTP_HOST || 'smtp.gmail.com', port: 465, secure: true, family: 4, connectionTimeout: 12000, greetingTimeout: 12000, socketTimeout: 30000, auth: smtpAuth }),
+]
 
 async function sendOtp(email, otp) {
-  await transporter.sendMail({
+  const message = {
     from: `SwitchForge by DTEmpire <${process.env.GMAIL_USER}>`, to: email,
     subject: `${otp} is your SwitchForge verification code`,
     text: `Your SwitchForge verification code is ${otp}. It expires in 10 minutes.`,
     html: `<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:32px;background:#0d131e;color:#e8edf7;border:1px solid #3b321d;border-radius:12px"><h2 style="margin-top:0">Verify your SwitchForge account</h2><p style="color:#aab4c4">Enter this code to finish creating your account:</p><div style="font-size:32px;letter-spacing:10px;font-weight:700;color:#d6ad4b;margin:28px 0">${otp}</div><p style="color:#718095;font-size:13px">This code expires in 10 minutes. If you did not request it, you can ignore this email.</p></div>`,
-  })
+  }
+  let lastError
+  for (const smtp of smtpTransports) {
+    try { await smtp.sendMail(message); return }
+    catch (error) { lastError = error }
+  }
+  throw lastError
 }
 
 function createSession(userId) {
@@ -150,6 +200,10 @@ function auth(req, res, next) {
   const user = session && db.users.find(u => u.id === session.userId)
   if (!user) return res.status(401).json({ error: { message: 'Authentication required', code: 'unauthorized' } })
   req.user = user; req.session = session; next()
+}
+function adminOnly(req, res, next) {
+  if (!isAdmin(req.user)) return res.status(403).json({ error: { message: 'Administrator access required.', code: 'forbidden' } })
+  next()
 }
 
 function keyView(key) {
@@ -169,11 +223,11 @@ app.post('/api/demo/chat', async (req, res) => {
     const recent = (demoUsage.get(client) || []).filter(time => now - time < 60 * 60 * 1000)
     if (recent.length >= 5) return res.status(429).json({ error: { message: 'Demo limit reached. Create an account to continue.' } })
     recent.push(now); demoUsage.set(client, recent)
-    const upstream = await fetch(upstreamUrl('/chat/completions'), upstreamOptions({ method: 'POST', headers: { Authorization: `Bearer ${process.env.OMNIROUTE_API_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: TIER_MODELS.free, messages: [{ role: 'system', content: 'Reply helpfully and concisely in no more than 80 words.' }, { role: 'user', content: message }], max_tokens: 140 }) }))
-    if (!upstream.ok) throw new Error(`Upstream returned ${upstream.status}`)
-    const data = await readChatResponse(upstream), reply = data.choices?.[0]?.message?.content
+    const tier = classifyTier([{ role: 'user', content: message }])
+    const result = await runDemoCompletion(tier, [{ role: 'system', content: `${SWITCHFORGE_SYSTEM} Reply concisely in no more than 80 words.` }, { role: 'user', content: message }])
+    const reply = result.data.choices?.[0]?.message?.content
     if (!reply) throw new Error('Upstream response did not contain a message')
-    res.json({ reply })
+    res.json({ reply, tier, model: PUBLIC_MODEL, routeModel: result.resolvedModel })
   } catch (error) { console.error(error); res.status(502).json({ error: { message: 'The live demo is temporarily unavailable.' } }) }
 })
 
@@ -225,6 +279,31 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/auth/me', auth, (req, res) => res.json({ user: publicUser(req.user) }))
 app.post('/api/auth/logout', auth, async (req, res) => { db.sessions = db.sessions.filter(s => s !== req.session); await saveDb(); res.status(204).end() })
 
+app.get('/api/admin/gateway', auth, adminOnly, (_req, res) => {
+  const config = gatewayConfig(), saved = db.settings?.gateway || {}
+  res.json({ gateway: { baseUrl: config.baseUrl, freeModel: config.freeModel, premiumModel: config.premiumModel, apiKeyConfigured: Boolean(config.apiKey), source: saved.updatedAt ? 'admin' : 'environment', updatedAt: saved.updatedAt || null } })
+})
+app.put('/api/admin/gateway', auth, adminOnly, async (req, res) => {
+  const baseUrl = String(req.body.baseUrl || '').trim().replace(/\/$/, '')
+  const freeModel = String(req.body.freeModel || '').trim(), premiumModel = String(req.body.premiumModel || '').trim(), apiKey = String(req.body.apiKey || '').trim()
+  try { const parsed = new URL(baseUrl); if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error() }
+  catch { return res.status(400).json({ error: { message: 'Enter a valid OmniRoute HTTP or HTTPS base URL.' } }) }
+  if (!freeModel || !premiumModel || freeModel.length > 120 || premiumModel.length > 120) return res.status(400).json({ error: { message: 'Enter valid free and premium model names.' } })
+  const previous = db.settings?.gateway || {}
+  db.settings ||= {}; db.settings.gateway = { ...previous, baseUrl, freeModel, premiumModel, updatedAt: new Date().toISOString(), updatedBy: req.user.id }
+  if (apiKey) db.settings.gateway.apiKeyEncrypted = encryptSecret(apiKey)
+  await saveDb()
+  res.json({ gateway: { baseUrl, freeModel, premiumModel, apiKeyConfigured: Boolean(apiKey || previous.apiKeyEncrypted || process.env.OMNIROUTE_API_KEY), source: 'admin', updatedAt: db.settings.gateway.updatedAt } })
+})
+app.post('/api/admin/gateway/test', auth, adminOnly, async (_req, res) => {
+  try {
+    const response = await fetch(upstreamUrl('/models'), upstreamOptions({ headers: { Authorization: `Bearer ${gatewayConfig().apiKey}` } }))
+    if (!response.ok) return res.status(502).json({ error: { message: `OmniRoute returned HTTP ${response.status}.` } })
+    const data = await response.json()
+    res.json({ ok: true, models: Array.isArray(data.data) ? data.data.length : null })
+  } catch { res.status(502).json({ error: { message: 'Could not connect to OmniRoute with the saved configuration.' } }) }
+})
+
 app.get('/api/keys', auth, (req, res) => res.json({ keys: db.keys.filter(k => k.userId === req.user.id && !k.revokedAt).map(keyView) }))
 app.post('/api/keys', auth, async (req, res) => {
   const active = db.keys.filter(k => k.userId === req.user.id && !k.revokedAt)
@@ -258,22 +337,22 @@ app.post('/v1/chat/completions', customerKey, async (req, res) => {
     const requestedTier = String(req.body.tier || req.headers['x-dtempire-tier'] || 'auto').toLowerCase()
     if (!['auto', 'free', 'premium'].includes(requestedTier)) return res.status(400).json({ error: { message: 'tier must be auto, free, or premium.', type: 'invalid_request_error' } })
     const tier = requestedTier === 'auto' ? classifyTier(req.body.messages) : requestedTier
-    const payload = { ...req.body, model: req.body.upstream_model || TIER_MODELS[tier] }; delete payload.tier; delete payload.upstream_model
+    const payload = { ...req.body, model: req.body.upstream_model || routeModel(tier), messages: [{ role: 'system', content: SWITCHFORGE_SYSTEM }, ...req.body.messages] }; delete payload.tier; delete payload.upstream_model
     const requestedTokens = Number(payload.max_completion_tokens || payload.max_tokens || 1024)
     const estimatedRequest = estimateTokens(payload.messages) + (Number.isFinite(requestedTokens) ? Math.max(0, requestedTokens) : 1024)
     if (req.apiKey.tokenUsed + estimatedRequest > req.apiKey.tokenLimit) return res.status(429).json({ error: { message: 'This request may exceed the remaining token allowance.', type: 'rate_limit_error', code: 'token_limit_exceeded' } })
-    const upstream = await fetch(upstreamUrl('/chat/completions'), upstreamOptions({ method: 'POST', headers: { Authorization: `Bearer ${process.env.OMNIROUTE_API_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }))
+    const upstream = await fetch(upstreamUrl('/chat/completions'), upstreamOptions({ method: 'POST', headers: { Authorization: `Bearer ${gatewayConfig().apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }))
     if (!upstream.ok) { const body = await upstream.text(); res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(body); return }
     if (payload.stream) {
-      res.status(200); res.setHeader('Content-Type', upstream.headers.get('content-type') || 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', TIER_MODELS[tier])
+      res.status(200); res.setHeader('Content-Type', upstream.headers.get('content-type') || 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', routeModel(tier))
       const reader = upstream.body.getReader(); let completionText = ''
       while (true) { const { done, value } = await reader.read(); if (done) break; const chunk = Buffer.from(value); completionText += chunk.toString('utf8'); res.write(chunk) }
       const estimated = estimateTokens(payload.messages) + estimateTokens(completionText); req.apiKey.tokenUsed += estimated; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, tokens: estimated, createdAt: new Date().toISOString() }); await saveDb(); res.end(); return
     }
     const data = await readChatResponse(upstream), used = Number(data.usage?.total_tokens || estimateTokens(payload.messages) + estimateTokens(data.choices?.[0]?.message?.content || ''))
     req.apiKey.tokenUsed += used; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, tokens: used, createdAt: new Date().toISOString() }); await saveDb()
-    data.model = PUBLIC_MODEL; data.switchforge = { tier, model: TIER_MODELS[tier], requested_tier: requestedTier }; data.dtempire = data.switchforge; res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', TIER_MODELS[tier]); res.json(data)
-  } catch (error) { console.error(error); res.status(502).json({ error: { message: 'OmniRoute is unavailable.', type: 'upstream_error' } }) }
+    data.model = PUBLIC_MODEL; data.switchforge = { tier, model: routeModel(tier), requested_tier: requestedTier }; data.dtempire = data.switchforge; res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', routeModel(tier)); res.json(data)
+  } catch (error) { console.error(error); if (!res.headersSent) res.status(502).json({ error: { message: 'OmniRoute is unavailable.', type: 'upstream_error' } }); else res.end() }
 })
 
 const dist = path.join(__dirname, '..', 'dist')
