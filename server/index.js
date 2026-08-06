@@ -84,7 +84,8 @@ function sha(value) { return crypto.createHash('sha256').update(value).digest('h
 function addMonths(date, months) { const next = new Date(date); next.setMonth(next.getMonth() + months); return next }
 function cleanEmail(value = '') { return String(value).trim().toLowerCase() }
 function isGmail(email) { return /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@gmail\.com$/i.test(email) }
-function isAdmin(user) { return Boolean(user && ADMIN_EMAILS.has(cleanEmail(user.email))) }
+function isOwnerAdmin(user) { return Boolean(user && ADMIN_EMAILS.has(cleanEmail(user.email))) }
+function isAdmin(user) { return Boolean(user && (isOwnerAdmin(user) || user.admin === true)) }
 function estimateTokens(value) { return Math.max(1, Math.ceil(JSON.stringify(value).length / 4)) }
 function classifyTier(messages = []) {
   const latest = messages.filter(message => !message.role || message.role === 'user').at(-1)
@@ -218,7 +219,7 @@ async function runDemoCompletion(tier, messages) {
   }
   throw lastError
 }
-function publicUser(user) { return { id: user.id, name: user.name, email: user.email, role: isAdmin(user) ? 'admin' : 'user', createdAt: user.createdAt, suspended: Boolean(user.suspendedAt), premiumAccess: isAdmin(user) || Boolean(user.premiumAccess) } }
+function publicUser(user) { return { id: user.id, name: user.name, email: user.email, role: isAdmin(user) ? 'admin' : 'user', ownerAdmin: isOwnerAdmin(user), createdAt: user.createdAt, suspended: Boolean(user.suspendedAt), premiumAccess: isAdmin(user) || Boolean(user.premiumAccess) } }
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   return { salt, hash: crypto.scryptSync(password, salt, 64).toString('hex') }
 }
@@ -409,6 +410,28 @@ app.put('/api/admin/users/:id/premium', auth, adminOnly, async (req, res) => {
   if (isAdmin(user)) return res.status(400).json({ error: { message: 'Administrators already have premium access.' } })
   user.premiumAccess = Boolean(req.body.enabled)
   await saveDb(); res.json({ user: publicUser(user) })
+})
+app.put('/api/admin/users/:id/role', auth, adminOnly, async (req, res) => {
+  const user = db.users.find(item => item.id === req.params.id)
+  if (!user) return res.status(404).json({ error: { message: 'User not found.' } })
+  const makeAdmin = Boolean(req.body.admin)
+  if (user.id === req.user.id && !makeAdmin) return res.status(400).json({ error: { message: 'You cannot remove your own administrator access.' } })
+  if (isOwnerAdmin(user) && !makeAdmin) return res.status(400).json({ error: { message: 'The configured owner administrator cannot be demoted.' } })
+  user.admin = makeAdmin
+  if (makeAdmin) { user.premiumAccess = true; user.suspendedAt = null }
+  await saveDb(); res.json({ user: publicUser(user) })
+})
+app.delete('/api/admin/users/:id', auth, adminOnly, async (req, res) => {
+  const user = db.users.find(item => item.id === req.params.id)
+  if (!user) return res.status(404).json({ error: { message: 'User not found.' } })
+  if (user.id === req.user.id) return res.status(400).json({ error: { message: 'You cannot delete your own account.' } })
+  if (isOwnerAdmin(user)) return res.status(400).json({ error: { message: 'The configured owner administrator cannot be deleted.' } })
+  const keyIds = new Set(db.keys.filter(key => key.userId === user.id).map(key => key.id))
+  db.users = db.users.filter(item => item.id !== user.id)
+  db.sessions = db.sessions.filter(item => item.userId !== user.id)
+  db.keys = db.keys.filter(item => item.userId !== user.id)
+  db.usage = db.usage.filter(item => !keyIds.has(item.keyId))
+  await saveDb(); res.status(204).end()
 })
 app.post('/api/admin/users/:id/grant', auth, adminOnly, async (req, res) => {
   const user = db.users.find(item => item.id === req.params.id)
