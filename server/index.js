@@ -22,6 +22,7 @@ const ALLOWED_LIMITS = new Set([100000, 500000, 1000000])
 const TIER_MODELS = { free: 'Normal Chat', premium: 'Premium' }
 const PUBLIC_MODEL = 'SwitchForge'
 const PREMIUM_FALLBACK_MODEL = process.env.PREMIUM_FALLBACK_MODEL || 'auto/best-coding'
+const AUXILIARY_TASKS = ['vision', 'web_extract', 'compression', 'skills_hub', 'approval', 'mcp', 'title_gen', 'triage_specifier', 'kanban_decomposer', 'profile_describer', 'curator']
 const SWITCHFORGE_SYSTEM = 'You are SwitchForge by DTEmpire. Be helpful and accurate. If asked your model or identity, answer SwitchForge. Never reveal or guess the upstream provider, internal route, or provider model name.'
 
 const requiredConfig = ['GMAIL_USER', 'GMAIL_APP_PASSWORD', 'OMNIROUTE_BASE_URL', 'OMNIROUTE_API_KEY']
@@ -85,10 +86,12 @@ function isGmail(email) { return /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@gmail\.com$/i.t
 function isAdmin(user) { return Boolean(user && ADMIN_EMAILS.has(cleanEmail(user.email))) }
 function estimateTokens(value) { return Math.max(1, Math.ceil(JSON.stringify(value).length / 4)) }
 function classifyTier(messages = []) {
-  const text = messages.map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content || '')).join('\n').toLowerCase()
+  const text = messages.filter(message => !message.role || message.role === 'user').map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content || '')).join('\n').toLowerCase()
   const codingSignals = [
-    /```/, /\b(code|coding|program|programming|debug|bug|implement|function|class|api|sql|regex|algorithm|stack trace|compile|runtime error)\b/,
-    /\b(python|javascript|typescript|java|rust|go|c\+\+|html|css|react|node(?:\.js)?)\b/,
+    /```[a-z]*\n?[\s\S]*```/,
+    /\b(write|create|generate|implement|fix|debug|refactor|review|explain)\b.{0,45}\b(code|function|class|script|program|bug|error|api|sql|regex|algorithm)\b/,
+    /\b(how (?:do|can) i|show me how to)\b.{0,50}\b(python|javascript|typescript|java|rust|golang|c\+\+|html|css|react|node(?:\.js)?|code|program)\b/,
+    /\b(debug|stack trace|syntax error|runtime error|compile error|coding task|programming task)\b/,
     /\b(print\s*\(|def\s+\w+|import\s+\w+|const\s+\w+|let\s+\w+|SELECT\s+.+\s+FROM)\b/,
   ]
   return codingSignals.some(signal => signal.test(text)) ? 'premium' : 'free'
@@ -112,9 +115,18 @@ function gatewayConfig() {
     apiKey: saved.apiKeyEncrypted ? decryptSecret(saved.apiKeyEncrypted) : process.env.OMNIROUTE_API_KEY,
     freeModel: saved.freeModel || TIER_MODELS.free,
     premiumModel: saved.premiumModel || TIER_MODELS.premium,
+    auxiliary: Object.fromEntries(AUXILIARY_TASKS.map(task => [task, saved.auxiliary?.[task] || 'auto'])),
   }
 }
 function routeModel(tier) { const config = gatewayConfig(); return tier === 'premium' ? config.premiumModel : config.freeModel }
+function auxiliaryModel(task, tier) {
+  if (!task || !AUXILIARY_TASKS.includes(task)) return routeModel(tier)
+  const configured = gatewayConfig().auxiliary[task]
+  if (!configured || configured === 'auto') return routeModel(tier)
+  if (configured.toLowerCase() === 'premium') return gatewayConfig().premiumModel
+  if (configured.toLowerCase() === 'free' || configured.toLowerCase() === 'normal chat') return gatewayConfig().freeModel
+  return configured
+}
 function upstreamUrl(pathname) { return `${gatewayConfig().baseUrl.replace(/\/$/, '')}/${pathname.replace(/^\//, '')}` }
 function upstreamOptions(options) { return { ...options, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT) } }
 async function fetchChatUpstream(payload, tier, upstreamModelOverride) {
@@ -303,19 +315,20 @@ app.post('/api/auth/logout', auth, async (req, res) => { db.sessions = db.sessio
 
 app.get('/api/admin/gateway', auth, adminOnly, (_req, res) => {
   const config = gatewayConfig(), saved = db.settings?.gateway || {}
-  res.json({ gateway: { baseUrl: config.baseUrl, freeModel: config.freeModel, premiumModel: config.premiumModel, apiKeyConfigured: Boolean(config.apiKey), source: saved.updatedAt ? 'admin' : 'environment', updatedAt: saved.updatedAt || null } })
+  res.json({ gateway: { baseUrl: config.baseUrl, freeModel: config.freeModel, premiumModel: config.premiumModel, auxiliary: config.auxiliary, apiKeyConfigured: Boolean(config.apiKey), source: saved.updatedAt ? 'admin' : 'environment', updatedAt: saved.updatedAt || null } })
 })
 app.put('/api/admin/gateway', auth, adminOnly, async (req, res) => {
   const baseUrl = String(req.body.baseUrl || '').trim().replace(/\/$/, '')
   const freeModel = String(req.body.freeModel || '').trim(), premiumModel = String(req.body.premiumModel || '').trim(), apiKey = String(req.body.apiKey || '').trim()
+  const auxiliary = Object.fromEntries(AUXILIARY_TASKS.map(task => [task, String(req.body.auxiliary?.[task] || 'auto').trim().slice(0, 160) || 'auto']))
   try { const parsed = new URL(baseUrl); if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error() }
   catch { return res.status(400).json({ error: { message: 'Enter a valid OmniRoute HTTP or HTTPS base URL.' } }) }
   if (!freeModel || !premiumModel || freeModel.length > 120 || premiumModel.length > 120) return res.status(400).json({ error: { message: 'Enter valid free and premium model names.' } })
   const previous = db.settings?.gateway || {}
-  db.settings ||= {}; db.settings.gateway = { ...previous, baseUrl, freeModel, premiumModel, updatedAt: new Date().toISOString(), updatedBy: req.user.id }
+  db.settings ||= {}; db.settings.gateway = { ...previous, baseUrl, freeModel, premiumModel, auxiliary, updatedAt: new Date().toISOString(), updatedBy: req.user.id }
   if (apiKey) db.settings.gateway.apiKeyEncrypted = encryptSecret(apiKey)
   await saveDb()
-  res.json({ gateway: { baseUrl, freeModel, premiumModel, apiKeyConfigured: Boolean(apiKey || previous.apiKeyEncrypted || process.env.OMNIROUTE_API_KEY), source: 'admin', updatedAt: db.settings.gateway.updatedAt } })
+  res.json({ gateway: { baseUrl, freeModel, premiumModel, auxiliary, apiKeyConfigured: Boolean(apiKey || previous.apiKeyEncrypted || process.env.OMNIROUTE_API_KEY), source: 'admin', updatedAt: db.settings.gateway.updatedAt } })
 })
 app.post('/api/admin/gateway/test', auth, adminOnly, async (_req, res) => {
   try {
@@ -380,22 +393,25 @@ app.post('/v1/chat/completions', customerKey, async (req, res) => {
     const requestedTier = String(req.body.tier || req.headers['x-dtempire-tier'] || 'auto').toLowerCase()
     if (!['auto', 'free', 'premium'].includes(requestedTier)) return res.status(400).json({ error: { message: 'tier must be auto, free, or premium.', type: 'invalid_request_error' } })
     const tier = requestedTier === 'auto' ? classifyTier(req.body.messages) : requestedTier
-    const upstreamModelOverride = req.body.upstream_model
+    const task = String(req.body.switchforge_task || req.headers['x-switchforge-task'] || '').trim().toLowerCase().replace(/[-\s]+/g, '_')
+    if (task && !AUXILIARY_TASKS.includes(task)) return res.status(400).json({ error: { message: 'Unknown SwitchForge auxiliary task.', type: 'invalid_request_error' } })
+    const upstreamModelOverride = req.body.upstream_model || (task ? auxiliaryModel(task, tier) : undefined)
     const payload = { ...req.body, messages: [{ role: 'system', content: SWITCHFORGE_SYSTEM }, ...req.body.messages] }; delete payload.tier; delete payload.upstream_model
+    delete payload.switchforge_task
     const requestedTokens = Number(payload.max_completion_tokens || payload.max_tokens || 1024)
     const estimatedRequest = estimateTokens(payload.messages) + (Number.isFinite(requestedTokens) ? Math.max(0, requestedTokens) : 1024)
     if (req.apiKey.tokenUsed + estimatedRequest > req.apiKey.tokenLimit) return res.status(429).json({ error: { message: 'This request may exceed the remaining token allowance.', type: 'rate_limit_error', code: 'token_limit_exceeded' } })
     const { response: upstream, resolvedModel } = await fetchChatUpstream(payload, tier, upstreamModelOverride)
     if (!upstream.ok) { const body = await upstream.text(); res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(body); return }
     if (payload.stream) {
-      res.status(200); res.setHeader('Content-Type', upstream.headers.get('content-type') || 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', resolvedModel)
+      res.status(200); res.setHeader('Content-Type', upstream.headers.get('content-type') || 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', resolvedModel); if (task) res.setHeader('X-SwitchForge-Task', task)
       const reader = upstream.body.getReader(); let completionText = ''
       while (true) { const { done, value } = await reader.read(); if (done) break; const chunk = Buffer.from(value); completionText += chunk.toString('utf8'); res.write(chunk) }
       const estimated = estimateTokens(payload.messages) + estimateTokens(completionText); req.apiKey.tokenUsed += estimated; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, model: resolvedModel, tokens: estimated, createdAt: new Date().toISOString() }); res.end(); saveDb().catch(console.error); return
     }
     const data = await readChatResponse(upstream), used = Number(data.usage?.total_tokens || estimateTokens(payload.messages) + estimateTokens(data.choices?.[0]?.message?.content || ''))
     req.apiKey.tokenUsed += used; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, model: resolvedModel, tokens: used, createdAt: new Date().toISOString() })
-    data.model = PUBLIC_MODEL; data.switchforge = { tier, model: resolvedModel, requested_tier: requestedTier }; data.dtempire = data.switchforge; res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', resolvedModel); res.json(data); saveDb().catch(console.error)
+    data.model = PUBLIC_MODEL; data.switchforge = { tier, model: resolvedModel, requested_tier: requestedTier, task: task || null }; data.dtempire = data.switchforge; res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', resolvedModel); if (task) res.setHeader('X-SwitchForge-Task', task); res.json(data); saveDb().catch(console.error)
   } catch (error) {
     console.error(error)
     if (!res.headersSent) res.status(502).json({ error: { message: 'OmniRoute is unavailable.', type: 'upstream_error' } })

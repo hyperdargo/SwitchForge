@@ -94,7 +94,7 @@ curl http://localhost:6010/v1/chat/completions \
   -d '{"model":"SwitchForge","tier":"free","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-By default, SwitchForge uses `auto`: coding and programming prompts route to Premium, while ordinary chat routes to Normal Chat. You can override the decision explicitly. Use premium routing by changing the tier:
+By default, SwitchForge uses conservative `auto` routing. Normal Chat has first priority. Only the user's messages are inspected, and clear coding, debugging, or implementation requests route to Premium. Provider and IDE system prompts are ignored so ordinary messages in coding clients remain fast. You can override the decision explicitly. Use premium routing by changing the tier:
 
 ```json
 {"model":"SwitchForge","tier":"premium","messages":[{"role":"user","content":"Review this architecture"}]}
@@ -107,6 +107,16 @@ Inspect the current key allowance:
 ```bash
 curl http://localhost:6010/v1/usage \
   -H "Authorization: Bearer $DT_API_KEY"
+```
+
+Auxiliary jobs can select a separately configured route with the `x-switchforge-task` header. Supported tasks include `vision`, `web_extract`, `compression`, `skills_hub`, `approval`, `mcp`, `title_gen`, `triage_specifier`, `kanban_decomposer`, `profile_describer`, and `curator`.
+
+```bash
+curl http://localhost:6010/v1/chat/completions \
+  -H "Authorization: Bearer $DT_API_KEY" \
+  -H "x-switchforge-task: compression" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"SwitchForge","messages":[{"role":"user","content":"Compact this context"}]}'
 ```
 
 ## Security Notes
