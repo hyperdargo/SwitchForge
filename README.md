@@ -24,7 +24,8 @@ The project includes a developer console, Gmail OTP signup, expiring API keys, u
 - Streaming and non-streaming response normalization
 - Per-key token allowances: 100K, 500K, or 1M
 - Key expiry: 1, 2, or 3 months
-- Maximum of three active keys per account
+- Maximum of three active keys per regular account
+- Admin-only unlimited key creation, unlimited tokens, and no-expiry keys
 - Usage endpoint and key revocation
 - Cloudflare R2-backed durable JSON persistence
 - Responsive console with walkthrough documentation
@@ -108,6 +109,8 @@ Inspect the current key allowance:
 curl http://localhost:6010/v1/usage \
   -H "Authorization: Bearer $DT_API_KEY"
 ```
+
+Administrators see two additional choices in the API key creation dialog: `Unlimited tokens` and `Never expires`. Admin accounts can also create more than three active keys. These values are enforced server-side, so sending `months: 0` or `tokenLimit: 0` as a regular user is rejected.
 
 Auxiliary jobs can select a separately configured route with the `x-switchforge-task` header. Supported tasks include `vision`, `web_extract`, `compression`, `skills_hub`, `approval`, `mcp`, `title_gen`, `triage_specifier`, `kanban_decomposer`, `profile_describer`, and `curator`.
 

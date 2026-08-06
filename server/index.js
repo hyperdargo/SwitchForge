@@ -266,7 +266,7 @@ function adminOnly(req, res, next) {
 }
 
 function keyView(key) {
-  return { id: key.id, name: key.name, prefix: key.prefix, lastFour: key.lastFour, createdAt: key.createdAt, expiresAt: key.expiresAt, tokenUsed: key.tokenUsed, tokenLimit: key.tokenLimit, status: key.revokedAt ? 'Revoked' : new Date(key.expiresAt) <= new Date() ? 'Expired' : key.tokenUsed >= key.tokenLimit ? 'Exhausted' : 'Active' }
+  return { id: key.id, name: key.name, prefix: key.prefix, lastFour: key.lastFour, createdAt: key.createdAt, expiresAt: key.expiresAt || null, tokenUsed: key.tokenUsed, tokenLimit: key.tokenLimit ?? null, status: key.revokedAt ? 'Revoked' : key.expiresAt && new Date(key.expiresAt) <= new Date() ? 'Expired' : key.tokenLimit != null && key.tokenUsed >= key.tokenLimit ? 'Exhausted' : 'Active' }
 }
 
 const app = express()
@@ -385,11 +385,13 @@ app.get('/api/usage', auth, (req, res) => {
 })
 app.post('/api/keys', auth, async (req, res) => {
   const active = db.keys.filter(k => k.userId === req.user.id && !k.revokedAt)
-  if (active.length >= 3) return res.status(409).json({ error: { message: 'Maximum of 3 API keys reached.' } })
+  if (!isAdmin(req.user) && active.length >= 3) return res.status(409).json({ error: { message: 'Maximum of 3 API keys reached.' } })
   const name = String(req.body.name || '').trim(), months = Number(req.body.months), tokenLimit = Number(req.body.tokenLimit)
-  if (!name || ![1,2,3].includes(months) || !ALLOWED_LIMITS.has(tokenLimit)) return res.status(400).json({ error: { message: 'Invalid key configuration.' } })
+  const validMonths = [1,2,3].includes(months) || (isAdmin(req.user) && months === 0)
+  const validLimit = ALLOWED_LIMITS.has(tokenLimit) || (isAdmin(req.user) && tokenLimit === 0)
+  if (!name || !validMonths || !validLimit) return res.status(400).json({ error: { message: 'Invalid key configuration.' } })
   const raw = `dt_live_${token(24)}`, now = new Date()
-  const key = { id: id(), userId: req.user.id, name, keyHash: sha(raw), prefix: raw.slice(0, 12), lastFour: raw.slice(-4), createdAt: now.toISOString(), expiresAt: addMonths(now, months).toISOString(), tokenUsed: 0, tokenLimit, revokedAt: null }
+  const key = { id: id(), userId: req.user.id, name, keyHash: sha(raw), prefix: raw.slice(0, 12), lastFour: raw.slice(-4), createdAt: now.toISOString(), expiresAt: months === 0 ? null : addMonths(now, months).toISOString(), tokenUsed: 0, tokenLimit: tokenLimit === 0 ? null : tokenLimit, revokedAt: null }
   db.keys.push(key); await saveDb(); res.status(201).json({ key: keyView(key), secret: raw })
 })
 app.delete('/api/keys/:id', auth, async (req, res) => {
@@ -402,8 +404,8 @@ function customerKey(req, res, next) {
   const raw = req.headers.authorization?.replace(/^Bearer\s+/i, '')
   const key = raw && db.keys.find(k => k.keyHash === sha(raw) && !k.revokedAt)
   if (!key) return res.status(401).json({ error: { message: 'Invalid API key.', type: 'authentication_error', code: 'invalid_api_key' } })
-  if (new Date(key.expiresAt) <= new Date()) return res.status(401).json({ error: { message: 'API key has expired.', type: 'authentication_error', code: 'key_expired' } })
-  if (key.tokenUsed >= key.tokenLimit) return res.status(429).json({ error: { message: 'Token allowance exhausted.', type: 'rate_limit_error', code: 'token_limit_exceeded' } })
+  if (key.expiresAt && new Date(key.expiresAt) <= new Date()) return res.status(401).json({ error: { message: 'API key has expired.', type: 'authentication_error', code: 'key_expired' } })
+  if (key.tokenLimit != null && key.tokenUsed >= key.tokenLimit) return res.status(429).json({ error: { message: 'Token allowance exhausted.', type: 'rate_limit_error', code: 'token_limit_exceeded' } })
   req.apiKey = key; next()
 }
 
@@ -412,7 +414,7 @@ app.get('/v1/models/:model', customerKey, (req, res) => {
   if (![PUBLIC_MODEL.toLowerCase(), 'dtempire'].includes(String(req.params.model).toLowerCase())) return res.status(404).json({ error: { message: 'Model not found.', type: 'invalid_request_error' } })
   res.json({ id: PUBLIC_MODEL, object: 'model', owned_by: 'dtempire' })
 })
-app.get('/v1/usage', customerKey, (req, res) => res.json({ token_used: req.apiKey.tokenUsed, token_limit: req.apiKey.tokenLimit, remaining: Math.max(0, req.apiKey.tokenLimit - req.apiKey.tokenUsed), expires_at: req.apiKey.expiresAt }))
+app.get('/v1/usage', customerKey, (req, res) => res.json({ token_used: req.apiKey.tokenUsed, token_limit: req.apiKey.tokenLimit ?? null, remaining: req.apiKey.tokenLimit == null ? null : Math.max(0, req.apiKey.tokenLimit - req.apiKey.tokenUsed), expires_at: req.apiKey.expiresAt || null }))
 app.post('/v1/chat/completions', customerKey, async (req, res) => {
   try {
     if (!Array.isArray(req.body.messages) || req.body.messages.length === 0) return res.status(400).json({ error: { message: 'messages must be a non-empty array.', type: 'invalid_request_error' } })
@@ -426,7 +428,7 @@ app.post('/v1/chat/completions', customerKey, async (req, res) => {
     delete payload.switchforge_task
     const requestedTokens = Number(payload.max_completion_tokens || payload.max_tokens || 1024)
     const estimatedRequest = estimateTokens(payload.messages) + (Number.isFinite(requestedTokens) ? Math.max(0, requestedTokens) : 1024)
-    if (req.apiKey.tokenUsed + estimatedRequest > req.apiKey.tokenLimit) return res.status(429).json({ error: { message: 'This request may exceed the remaining token allowance.', type: 'rate_limit_error', code: 'token_limit_exceeded' } })
+    if (req.apiKey.tokenLimit != null && req.apiKey.tokenUsed + estimatedRequest > req.apiKey.tokenLimit) return res.status(429).json({ error: { message: 'This request may exceed the remaining token allowance.', type: 'rate_limit_error', code: 'token_limit_exceeded' } })
     console.log(`SwitchForge route tier=${tier} model=${upstreamModelOverride || routeModel(tier)} task=${task || 'main'} stream=${Boolean(payload.stream)}`)
     let { response: upstream, resolvedModel } = await fetchChatUpstream(payload, tier, upstreamModelOverride)
     if (!upstream.ok) { const body = await upstream.text(); res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(body); return }
