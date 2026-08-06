@@ -234,6 +234,7 @@ function keyView(key) {
 const app = express()
 app.disable('x-powered-by')
 app.use(express.json({ limit: '2mb' }))
+app.use((req, res, next) => { const started = Date.now(); res.on('finish', () => console.log(`${req.method} ${req.path} ${res.statusCode} ${Date.now() - started}ms`)); next() })
 
 const demoUsage = new Map()
 app.post('/api/demo/chat', async (req, res) => {
@@ -326,6 +327,23 @@ app.post('/api/admin/gateway/test', auth, adminOnly, async (_req, res) => {
 })
 
 app.get('/api/keys', auth, (req, res) => res.json({ keys: db.keys.filter(k => k.userId === req.user.id && !k.revokedAt).map(keyView) }))
+app.get('/api/usage', auth, (req, res) => {
+  const userKeys = db.keys.filter(key => key.userId === req.user.id)
+  const keyIds = new Set(userKeys.map(key => key.id))
+  const events = db.usage.filter(event => keyIds.has(event.keyId)).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+  const since = Date.now() - 30 * 24 * 60 * 60 * 1000
+  const recentEvents = events.filter(event => new Date(event.createdAt).getTime() >= since)
+  const dailyMap = new Map()
+  for (let offset = 29; offset >= 0; offset -= 1) { const date = new Date(Date.now() - offset * 86400000).toISOString().slice(0, 10); dailyMap.set(date, { date, requests: 0, tokens: 0 }) }
+  for (const event of recentEvents) { const day = event.createdAt.slice(0, 10), entry = dailyMap.get(day); if (entry) { entry.requests += 1; entry.tokens += Number(event.tokens || 0) } }
+  const keyNames = new Map(userKeys.map(key => [key.id, key.name]))
+  res.json({
+    summary: { requests: events.length, tokens: events.reduce((sum, event) => sum + Number(event.tokens || 0), 0), freeRequests: events.filter(event => event.tier === 'free').length, premiumRequests: events.filter(event => event.tier === 'premium').length },
+    daily: [...dailyMap.values()],
+    keys: userKeys.map(key => ({ ...keyView(key), requests: events.filter(event => event.keyId === key.id).length })),
+    recent: events.slice(0, 20).map(event => ({ ...event, keyName: keyNames.get(event.keyId) || 'Deleted key' })),
+  })
+})
 app.post('/api/keys', auth, async (req, res) => {
   const active = db.keys.filter(k => k.userId === req.user.id && !k.revokedAt)
   if (active.length >= 3) return res.status(409).json({ error: { message: 'Maximum of 3 API keys reached.' } })
@@ -351,6 +369,10 @@ function customerKey(req, res, next) {
 }
 
 app.get('/v1/models', customerKey, (_req, res) => res.json({ object: 'list', data: [{ id: PUBLIC_MODEL, object: 'model', owned_by: 'dtempire' }, { id: 'DTEmpire', object: 'model', owned_by: 'dtempire', deprecated: true }] }))
+app.get('/v1/models/:model', customerKey, (req, res) => {
+  if (![PUBLIC_MODEL.toLowerCase(), 'dtempire'].includes(String(req.params.model).toLowerCase())) return res.status(404).json({ error: { message: 'Model not found.', type: 'invalid_request_error' } })
+  res.json({ id: PUBLIC_MODEL, object: 'model', owned_by: 'dtempire' })
+})
 app.get('/v1/usage', customerKey, (req, res) => res.json({ token_used: req.apiKey.tokenUsed, token_limit: req.apiKey.tokenLimit, remaining: Math.max(0, req.apiKey.tokenLimit - req.apiKey.tokenUsed), expires_at: req.apiKey.expiresAt }))
 app.post('/v1/chat/completions', customerKey, async (req, res) => {
   try {
@@ -374,7 +396,11 @@ app.post('/v1/chat/completions', customerKey, async (req, res) => {
     const data = await readChatResponse(upstream), used = Number(data.usage?.total_tokens || estimateTokens(payload.messages) + estimateTokens(data.choices?.[0]?.message?.content || ''))
     req.apiKey.tokenUsed += used; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, model: resolvedModel, tokens: used, createdAt: new Date().toISOString() })
     data.model = PUBLIC_MODEL; data.switchforge = { tier, model: resolvedModel, requested_tier: requestedTier }; data.dtempire = data.switchforge; res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', resolvedModel); res.json(data); saveDb().catch(console.error)
-  } catch (error) { console.error(error); if (!res.headersSent) res.status(502).json({ error: { message: 'OmniRoute is unavailable.', type: 'upstream_error' } }); else res.end() }
+  } catch (error) {
+    console.error(error)
+    if (!res.headersSent) res.status(502).json({ error: { message: 'OmniRoute is unavailable.', type: 'upstream_error' } })
+    else if (!res.writableEnded) { res.write(`data: ${JSON.stringify({ error: { message: 'The upstream stream ended unexpectedly.', type: 'upstream_error' } })}\n\ndata: [DONE]\n\n`); res.end() }
+  }
 })
 
 const dist = path.join(__dirname, '..', 'dist')

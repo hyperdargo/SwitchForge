@@ -1,7 +1,6 @@
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
-import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist')
@@ -18,23 +17,21 @@ const mimeTypes = {
   '.webmanifest': 'application/manifest+json',
 }
 
-async function proxy(req, res) {
-  try {
-    const headers = { ...req.headers }
-    delete headers.host
-    const response = await fetch(`${backendUrl}${req.url}`, {
-      method: req.method,
-      headers,
-      body: ['GET', 'HEAD'].includes(req.method) ? undefined : req,
-      duplex: 'half',
-    })
-    res.writeHead(response.status, Object.fromEntries(response.headers))
-    if (response.body) Readable.fromWeb(response.body).pipe(res)
-    else res.end()
-  } catch {
+function proxy(req, res) {
+  const target = new URL(req.url, backendUrl)
+  const upstream = http.request({ hostname: target.hostname, port: target.port || 80, path: `${target.pathname}${target.search}`, method: req.method, headers: { ...req.headers, host: target.host } }, response => {
+    res.writeHead(response.statusCode || 502, response.headers)
+    response.pipe(res)
+    response.on('error', () => { if (!res.writableEnded) res.end() })
+  })
+  upstream.on('error', () => {
+    if (res.headersSent) { if (!res.writableEnded) res.end(); return }
     res.writeHead(502, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ error: { message: 'Backend is unavailable.' } }))
-  }
+  })
+  req.on('aborted', () => upstream.destroy())
+  res.on('close', () => { if (!upstream.destroyed) upstream.destroy() })
+  req.pipe(upstream)
 }
 
 function serve(req, res) {
