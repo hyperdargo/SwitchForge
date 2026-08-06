@@ -216,7 +216,7 @@ async function runDemoCompletion(tier, messages) {
   }
   throw lastError
 }
-function publicUser(user) { return { id: user.id, name: user.name, email: user.email, role: isAdmin(user) ? 'admin' : 'user', createdAt: user.createdAt } }
+function publicUser(user) { return { id: user.id, name: user.name, email: user.email, role: isAdmin(user) ? 'admin' : 'user', createdAt: user.createdAt, suspended: Boolean(user.suspendedAt), premiumAccess: isAdmin(user) || Boolean(user.premiumAccess) } }
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   return { salt, hash: crypto.scryptSync(password, salt, 64).toString('hex') }
 }
@@ -258,6 +258,7 @@ function auth(req, res, next) {
   const session = raw && db.sessions.find(s => s.tokenHash === sha(raw) && new Date(s.expiresAt) > new Date())
   const user = session && db.users.find(u => u.id === session.userId)
   if (!user) return res.status(401).json({ error: { message: 'Authentication required', code: 'unauthorized' } })
+  if (user.suspendedAt) return res.status(403).json({ error: { message: 'This account has been suspended.', code: 'account_suspended' } })
   req.user = user; req.session = session; next()
 }
 function adminOnly(req, res, next) {
@@ -334,10 +335,21 @@ app.post('/api/auth/verify', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   const email = cleanEmail(req.body.email), user = db.users.find(u => u.email === email)
   if (!user || !validPassword(String(req.body.password || ''), user)) return res.status(401).json({ error: { message: 'Email or password is incorrect.' } })
+  if (user.suspendedAt) return res.status(403).json({ error: { message: 'This account has been suspended. Contact the administrator.' } })
   const sessionToken = createSession(user.id); await saveDb(); res.json({ token: sessionToken, user: publicUser(user) })
 })
 app.get('/api/auth/me', auth, (req, res) => res.json({ user: publicUser(req.user) }))
 app.post('/api/auth/logout', auth, async (req, res) => { db.sessions = db.sessions.filter(s => s !== req.session); await saveDb(); res.status(204).end() })
+app.put('/api/auth/password', auth, async (req, res) => {
+  const currentPassword = String(req.body.currentPassword || ''), newPassword = String(req.body.newPassword || '')
+  if (!validPassword(currentPassword, req.user)) return res.status(400).json({ error: { message: 'Current password is incorrect.' } })
+  if (newPassword.length < 8) return res.status(400).json({ error: { message: 'New password must be at least 8 characters.' } })
+  if (currentPassword === newPassword) return res.status(400).json({ error: { message: 'Choose a password different from your current password.' } })
+  const passwordData = hashPassword(newPassword)
+  req.user.passwordHash = passwordData.hash; req.user.passwordSalt = passwordData.salt
+  db.sessions = db.sessions.filter(item => item.userId !== req.user.id || item.id === req.session.id)
+  await saveDb(); res.json({ message: 'Password changed successfully.' })
+})
 
 app.get('/api/admin/gateway', auth, adminOnly, (_req, res) => {
   const config = gatewayConfig(), saved = db.settings?.gateway || {}
@@ -356,13 +368,53 @@ app.put('/api/admin/gateway', auth, adminOnly, async (req, res) => {
   await saveDb()
   res.json({ gateway: { baseUrl, freeModel, premiumModel, auxiliary, apiKeyConfigured: Boolean(apiKey || previous.apiKeyEncrypted || process.env.OMNIROUTE_API_KEY), source: 'admin', updatedAt: db.settings.gateway.updatedAt } })
 })
-app.post('/api/admin/gateway/test', auth, adminOnly, async (_req, res) => {
+app.post('/api/admin/gateway/test', auth, adminOnly, async (req, res) => {
   try {
-    const response = await fetch(upstreamUrl('/models'), upstreamOptions({ headers: { Authorization: `Bearer ${gatewayConfig().apiKey}` } }))
+    const saved = gatewayConfig()
+    const baseUrl = String(req.body.baseUrl || saved.baseUrl || '').trim().replace(/\/$/, '')
+    const apiKey = String(req.body.apiKey || '').trim() || saved.apiKey
+    const parsed = new URL(baseUrl)
+    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('invalid_url')
+    if (!apiKey) return res.status(400).json({ error: { message: 'Enter an OmniRoute API key before testing.' } })
+    const response = await fetch(`${baseUrl}/models`, upstreamOptions({ headers: { Authorization: `Bearer ${apiKey}` } }))
     if (!response.ok) return res.status(502).json({ error: { message: `OmniRoute returned HTTP ${response.status}.` } })
     const data = await response.json()
-    res.json({ ok: true, models: Array.isArray(data.data) ? data.data.length : null })
-  } catch { res.status(502).json({ error: { message: 'Could not connect to OmniRoute with the saved configuration.' } }) }
+    const models = [...new Set((Array.isArray(data.data) ? data.data : []).map(model => typeof model === 'string' ? model : model?.id).filter(Boolean))].sort((a, b) => a.localeCompare(b))
+    res.json({ ok: true, count: models.length, models })
+  } catch { res.status(502).json({ error: { message: 'Could not connect to OmniRoute with this URL and API key.' } }) }
+})
+
+app.get('/api/admin/users', auth, adminOnly, (_req, res) => {
+  const users = db.users.map(user => {
+    const keys = db.keys.filter(key => key.userId === user.id)
+    const keyIds = new Set(keys.map(key => key.id))
+    const events = db.usage.filter(event => keyIds.has(event.keyId))
+    return { ...publicUser(user), tokens: events.reduce((sum, event) => sum + Number(event.tokens || 0), 0), requests: events.length, activeKeys: keys.filter(key => !key.revokedAt).length }
+  }).sort((a, b) => b.tokens - a.tokens)
+  res.json({ users })
+})
+app.put('/api/admin/users/:id/suspension', auth, adminOnly, async (req, res) => {
+  const user = db.users.find(item => item.id === req.params.id)
+  if (!user) return res.status(404).json({ error: { message: 'User not found.' } })
+  if (user.id === req.user.id || isAdmin(user)) return res.status(400).json({ error: { message: 'Administrator accounts cannot be suspended here.' } })
+  user.suspendedAt = req.body.suspended ? new Date().toISOString() : null
+  if (user.suspendedAt) db.sessions = db.sessions.filter(session => session.userId !== user.id)
+  await saveDb(); res.json({ user: publicUser(user) })
+})
+app.put('/api/admin/users/:id/premium', auth, adminOnly, async (req, res) => {
+  const user = db.users.find(item => item.id === req.params.id)
+  if (!user) return res.status(404).json({ error: { message: 'User not found.' } })
+  if (isAdmin(user)) return res.status(400).json({ error: { message: 'Administrators already have premium access.' } })
+  user.premiumAccess = Boolean(req.body.enabled)
+  await saveDb(); res.json({ user: publicUser(user) })
+})
+app.post('/api/admin/users/:id/grant', auth, adminOnly, async (req, res) => {
+  const user = db.users.find(item => item.id === req.params.id)
+  if (!user) return res.status(404).json({ error: { message: 'User not found.' } })
+  const key = db.keys.filter(item => item.userId === user.id && !item.revokedAt && item.tokenLimit != null && (!item.expiresAt || new Date(item.expiresAt) > new Date())).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0]
+  if (!key) return res.status(409).json({ error: { message: 'This user has no active metered API key.' } })
+  key.tokenLimit += 100000
+  await saveDb(); res.json({ key: keyView(key), granted: 100000 })
 })
 
 app.get('/api/keys', auth, (req, res) => res.json({ keys: db.keys.filter(k => k.userId === req.user.id && !k.revokedAt).map(keyView) }))
@@ -404,9 +456,11 @@ function customerKey(req, res, next) {
   const raw = req.headers.authorization?.replace(/^Bearer\s+/i, '')
   const key = raw && db.keys.find(k => k.keyHash === sha(raw) && !k.revokedAt)
   if (!key) return res.status(401).json({ error: { message: 'Invalid API key.', type: 'authentication_error', code: 'invalid_api_key' } })
+  const user = db.users.find(item => item.id === key.userId)
+  if (!user || user.suspendedAt) return res.status(403).json({ error: { message: 'This account has been suspended.', type: 'authentication_error', code: 'account_suspended' } })
   if (key.expiresAt && new Date(key.expiresAt) <= new Date()) return res.status(401).json({ error: { message: 'API key has expired.', type: 'authentication_error', code: 'key_expired' } })
   if (key.tokenLimit != null && key.tokenUsed >= key.tokenLimit) return res.status(429).json({ error: { message: 'Token allowance exhausted.', type: 'rate_limit_error', code: 'token_limit_exceeded' } })
-  req.apiKey = key; next()
+  req.apiKey = key; req.apiUser = user; next()
 }
 
 app.get('/v1/models', customerKey, (_req, res) => res.json({ object: 'list', data: [{ id: PUBLIC_MODEL, object: 'model', owned_by: 'dtempire' }, { id: 'DTEmpire', object: 'model', owned_by: 'dtempire', deprecated: true }] }))
@@ -420,10 +474,12 @@ app.post('/v1/chat/completions', customerKey, async (req, res) => {
     if (!Array.isArray(req.body.messages) || req.body.messages.length === 0) return res.status(400).json({ error: { message: 'messages must be a non-empty array.', type: 'invalid_request_error' } })
     const requestedTier = String(req.body.tier || req.headers['x-dtempire-tier'] || 'auto').toLowerCase()
     if (!['auto', 'free', 'premium'].includes(requestedTier)) return res.status(400).json({ error: { message: 'tier must be auto, free, or premium.', type: 'invalid_request_error' } })
-    const tier = requestedTier === 'auto' ? classifyTier(req.body.messages) : requestedTier
+    const premiumAllowed = isAdmin(req.apiUser) || Boolean(req.apiUser.premiumAccess)
+    const resolvedRequestedTier = requestedTier === 'auto' ? classifyTier(req.body.messages) : requestedTier
+    const tier = premiumAllowed ? resolvedRequestedTier : 'free'
     const task = String(req.body.switchforge_task || req.headers['x-switchforge-task'] || '').trim().toLowerCase().replace(/[-\s]+/g, '_')
     if (task && !AUXILIARY_TASKS.includes(task)) return res.status(400).json({ error: { message: 'Unknown SwitchForge auxiliary task.', type: 'invalid_request_error' } })
-    const upstreamModelOverride = req.body.upstream_model || (task ? auxiliaryModel(task, tier) : undefined)
+    const upstreamModelOverride = premiumAllowed ? (req.body.upstream_model || (task ? auxiliaryModel(task, tier) : undefined)) : undefined
     const payload = { ...req.body, messages: [{ role: 'system', content: SWITCHFORGE_SYSTEM }, ...req.body.messages] }; delete payload.tier; delete payload.upstream_model
     delete payload.switchforge_task
     const requestedTokens = Number(payload.max_completion_tokens || payload.max_tokens || 1024)
@@ -450,7 +506,7 @@ app.post('/v1/chat/completions', customerKey, async (req, res) => {
     }
     const data = await readChatResponse(upstream), used = Number(data.usage?.total_tokens || estimateTokens(payload.messages) + estimateTokens(data.choices?.[0]?.message?.content || ''))
     req.apiKey.tokenUsed += used; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, model: resolvedModel, tokens: used, createdAt: new Date().toISOString() })
-    data.model = PUBLIC_MODEL; data.switchforge = { tier, model: resolvedModel, requested_tier: requestedTier, task: task || null }; data.dtempire = data.switchforge; res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', resolvedModel); if (task) res.setHeader('X-SwitchForge-Task', task); res.json(data); saveDb().catch(console.error)
+    data.model = PUBLIC_MODEL; data.switchforge = { tier, model: resolvedModel, requested_tier: requestedTier, premium_access: premiumAllowed, task: task || null }; data.dtempire = data.switchforge; res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', resolvedModel); if (task) res.setHeader('X-SwitchForge-Task', task); res.json(data); saveDb().catch(console.error)
   } catch (error) {
     console.error(error)
     if (!res.headersSent) res.status(502).json({ error: { message: 'OmniRoute is unavailable.', type: 'upstream_error' } })

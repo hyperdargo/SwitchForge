@@ -26,6 +26,10 @@ The project includes a developer console, Gmail OTP signup, expiring API keys, u
 - Key expiry: 1, 2, or 3 months
 - Maximum of three active keys per regular account
 - Admin-only unlimited key creation, unlimited tokens, and no-expiry keys
+- Admin gateway testing with provider model discovery and route selectors
+- Admin user usage ranking, suspension/restoration, and 100K token grants
+- Free-only access by default, with per-user Premium access controlled by admins
+- Account password changes from the console settings
 - Usage endpoint and key revocation
 - Cloudflare R2-backed durable JSON persistence
 - Responsive console with walkthrough documentation
@@ -95,7 +99,7 @@ curl http://localhost:6010/v1/chat/completions \
   -d '{"model":"SwitchForge","tier":"free","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-By default, SwitchForge uses conservative `auto` routing. Normal Chat has first priority. Only the user's messages are inspected, and clear coding, debugging, or implementation requests route to Premium. Provider and IDE system prompts are ignored so ordinary messages in coding clients remain fast. You can override the decision explicitly. Use premium routing by changing the tier:
+New regular accounts are Free-only. Every request from those accounts uses the configured Free route, even when `tier: premium` is requested or a coding prompt is detected. An administrator can grant Premium access to a specific user from **Admin → Users & usage**. Premium-enabled users use conservative `auto` routing: ordinary chat stays on Free, while clear coding, debugging, or implementation requests route to Premium. Provider and IDE system prompts are ignored so ordinary messages in coding clients remain fast.
 
 ```json
 {"model":"SwitchForge","tier":"premium","messages":[{"role":"user","content":"Review this architecture"}]}
