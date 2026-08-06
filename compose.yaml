@@ -1,0 +1,42 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
+    env_file:
+      - .env
+    environment:
+      PORT: 6010
+      SERVE_FRONTEND: "false"
+      OMNIROUTE_BASE_URL: ${DOCKER_OMNIROUTE_BASE_URL:-http://host.docker.internal:20128/v1}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "6010:6010"
+    volumes:
+      - switchforge-data:/app/server/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:6010/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
+    ports:
+      - "6009:6009"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  switchforge-data:
