@@ -1611,6 +1611,7 @@ function Dashboard({ user, onLogout, onDocs }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [view, setView] = useState("overview");
   const [loading, setLoading] = useState(true);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => window.innerWidth <= 900);
   const total = keys.reduce((a, k) => a + k.tokenUsed, 0);
   useEffect(() => {
     if (toast) {
@@ -1662,7 +1663,7 @@ function Dashboard({ user, onLogout, onDocs }) {
     );
   };
   return (
-    <div className="app-shell">
+    <div className={`app-shell${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
       <aside>
         <Brand />
         <nav>
@@ -1727,7 +1728,7 @@ function Dashboard({ user, onLogout, onDocs }) {
       </aside>
       <main className="dashboard">
         <header>
-          <button className="mobile-menu">
+          <button className="mobile-menu" onClick={() => setSidebarCollapsed((value) => !value)} title="Toggle sidebar">
             <Menu />
           </button>
           <div className="header-right">
