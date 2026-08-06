@@ -117,6 +117,27 @@ function gatewayConfig() {
 function routeModel(tier) { const config = gatewayConfig(); return tier === 'premium' ? config.premiumModel : config.freeModel }
 function upstreamUrl(pathname) { return `${gatewayConfig().baseUrl.replace(/\/$/, '')}/${pathname.replace(/^\//, '')}` }
 function upstreamOptions(options) { return { ...options, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT) } }
+async function fetchChatUpstream(payload, tier, upstreamModelOverride) {
+  const primary = upstreamModelOverride || (payload.stream && tier === 'premium' ? PREMIUM_FALLBACK_MODEL : routeModel(tier))
+  const models = tier === 'premium' && primary !== PREMIUM_FALLBACK_MODEL ? [primary, PREMIUM_FALLBACK_MODEL] : [primary]
+  let lastError
+  for (const [index, model] of models.entries()) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), index === 0 && models.length > 1 ? 12000 : UPSTREAM_TIMEOUT)
+    try {
+      const response = await fetch(upstreamUrl('/chat/completions'), {
+        method: 'POST',
+        signal: controller.signal,
+        headers: { Authorization: `Bearer ${gatewayConfig().apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...payload, model }),
+      })
+      clearTimeout(timeout)
+      if (!response.ok && index < models.length - 1 && response.status >= 500) { await response.body?.cancel().catch(() => {}); continue }
+      return { response, resolvedModel: model }
+    } catch (error) { clearTimeout(timeout); lastError = error }
+  }
+  throw lastError
+}
 async function readChatResponse(response) {
   const contentType = response.headers.get('content-type') || ''
   if (contentType.includes('application/json')) return response.json()
@@ -337,21 +358,22 @@ app.post('/v1/chat/completions', customerKey, async (req, res) => {
     const requestedTier = String(req.body.tier || req.headers['x-dtempire-tier'] || 'auto').toLowerCase()
     if (!['auto', 'free', 'premium'].includes(requestedTier)) return res.status(400).json({ error: { message: 'tier must be auto, free, or premium.', type: 'invalid_request_error' } })
     const tier = requestedTier === 'auto' ? classifyTier(req.body.messages) : requestedTier
-    const payload = { ...req.body, model: req.body.upstream_model || routeModel(tier), messages: [{ role: 'system', content: SWITCHFORGE_SYSTEM }, ...req.body.messages] }; delete payload.tier; delete payload.upstream_model
+    const upstreamModelOverride = req.body.upstream_model
+    const payload = { ...req.body, messages: [{ role: 'system', content: SWITCHFORGE_SYSTEM }, ...req.body.messages] }; delete payload.tier; delete payload.upstream_model
     const requestedTokens = Number(payload.max_completion_tokens || payload.max_tokens || 1024)
     const estimatedRequest = estimateTokens(payload.messages) + (Number.isFinite(requestedTokens) ? Math.max(0, requestedTokens) : 1024)
     if (req.apiKey.tokenUsed + estimatedRequest > req.apiKey.tokenLimit) return res.status(429).json({ error: { message: 'This request may exceed the remaining token allowance.', type: 'rate_limit_error', code: 'token_limit_exceeded' } })
-    const upstream = await fetch(upstreamUrl('/chat/completions'), upstreamOptions({ method: 'POST', headers: { Authorization: `Bearer ${gatewayConfig().apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }))
+    const { response: upstream, resolvedModel } = await fetchChatUpstream(payload, tier, upstreamModelOverride)
     if (!upstream.ok) { const body = await upstream.text(); res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(body); return }
     if (payload.stream) {
-      res.status(200); res.setHeader('Content-Type', upstream.headers.get('content-type') || 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', routeModel(tier))
+      res.status(200); res.setHeader('Content-Type', upstream.headers.get('content-type') || 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', resolvedModel)
       const reader = upstream.body.getReader(); let completionText = ''
       while (true) { const { done, value } = await reader.read(); if (done) break; const chunk = Buffer.from(value); completionText += chunk.toString('utf8'); res.write(chunk) }
-      const estimated = estimateTokens(payload.messages) + estimateTokens(completionText); req.apiKey.tokenUsed += estimated; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, tokens: estimated, createdAt: new Date().toISOString() }); await saveDb(); res.end(); return
+      const estimated = estimateTokens(payload.messages) + estimateTokens(completionText); req.apiKey.tokenUsed += estimated; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, model: resolvedModel, tokens: estimated, createdAt: new Date().toISOString() }); res.end(); saveDb().catch(console.error); return
     }
     const data = await readChatResponse(upstream), used = Number(data.usage?.total_tokens || estimateTokens(payload.messages) + estimateTokens(data.choices?.[0]?.message?.content || ''))
-    req.apiKey.tokenUsed += used; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, tokens: used, createdAt: new Date().toISOString() }); await saveDb()
-    data.model = PUBLIC_MODEL; data.switchforge = { tier, model: routeModel(tier), requested_tier: requestedTier }; data.dtempire = data.switchforge; res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', routeModel(tier)); res.json(data)
+    req.apiKey.tokenUsed += used; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, model: resolvedModel, tokens: used, createdAt: new Date().toISOString() })
+    data.model = PUBLIC_MODEL; data.switchforge = { tier, model: resolvedModel, requested_tier: requestedTier }; data.dtempire = data.switchforge; res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', resolvedModel); res.json(data); saveDb().catch(console.error)
   } catch (error) { console.error(error); if (!res.headersSent) res.status(502).json({ error: { message: 'OmniRoute is unavailable.', type: 'upstream_error' } }); else res.end() }
 })
 
