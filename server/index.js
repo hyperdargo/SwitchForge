@@ -79,6 +79,15 @@ function addMonths(date, months) { const next = new Date(date); next.setMonth(ne
 function cleanEmail(value = '') { return String(value).trim().toLowerCase() }
 function isGmail(email) { return /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@gmail\.com$/i.test(email) }
 function estimateTokens(value) { return Math.max(1, Math.ceil(JSON.stringify(value).length / 4)) }
+function classifyTier(messages = []) {
+  const text = messages.map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content || '')).join('\n').toLowerCase()
+  const codingSignals = [
+    /```/, /\b(code|coding|program|programming|debug|bug|implement|function|class|api|sql|regex|algorithm|stack trace|compile|runtime error)\b/,
+    /\b(python|javascript|typescript|java|rust|go|c\+\+|html|css|react|node(?:\.js)?)\b/,
+    /\b(print\s*\(|def\s+\w+|import\s+\w+|const\s+\w+|let\s+\w+|SELECT\s+.+\s+FROM)\b/,
+  ]
+  return codingSignals.some(signal => signal.test(text)) ? 'premium' : 'free'
+}
 function upstreamUrl(pathname) { return `${process.env.OMNIROUTE_BASE_URL.replace(/\/$/, '')}/${pathname.replace(/^\//, '')}` }
 function upstreamOptions(options) { return { ...options, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT) } }
 async function readChatResponse(response) {
@@ -240,8 +249,9 @@ app.get('/v1/usage', customerKey, (req, res) => res.json({ token_used: req.apiKe
 app.post('/v1/chat/completions', customerKey, async (req, res) => {
   try {
     if (!Array.isArray(req.body.messages) || req.body.messages.length === 0) return res.status(400).json({ error: { message: 'messages must be a non-empty array.', type: 'invalid_request_error' } })
-    const tier = String(req.body.tier || req.headers['x-dtempire-tier'] || 'free').toLowerCase()
-    if (!['free', 'premium'].includes(tier)) return res.status(400).json({ error: { message: 'tier must be free or premium.', type: 'invalid_request_error' } })
+    const requestedTier = String(req.body.tier || req.headers['x-dtempire-tier'] || 'auto').toLowerCase()
+    if (!['auto', 'free', 'premium'].includes(requestedTier)) return res.status(400).json({ error: { message: 'tier must be auto, free, or premium.', type: 'invalid_request_error' } })
+    const tier = requestedTier === 'auto' ? classifyTier(req.body.messages) : requestedTier
     const payload = { ...req.body, model: req.body.upstream_model || TIER_MODELS[tier] }; delete payload.tier; delete payload.upstream_model
     const requestedTokens = Number(payload.max_completion_tokens || payload.max_tokens || 1024)
     const estimatedRequest = estimateTokens(payload.messages) + (Number.isFinite(requestedTokens) ? Math.max(0, requestedTokens) : 1024)
@@ -249,14 +259,14 @@ app.post('/v1/chat/completions', customerKey, async (req, res) => {
     const upstream = await fetch(upstreamUrl('/chat/completions'), upstreamOptions({ method: 'POST', headers: { Authorization: `Bearer ${process.env.OMNIROUTE_API_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }))
     if (!upstream.ok) { const body = await upstream.text(); res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(body); return }
     if (payload.stream) {
-      res.status(200); res.setHeader('Content-Type', upstream.headers.get('content-type') || 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('X-DTEmpire-Tier', tier)
+      res.status(200); res.setHeader('Content-Type', upstream.headers.get('content-type') || 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', TIER_MODELS[tier])
       const reader = upstream.body.getReader(); let completionText = ''
       while (true) { const { done, value } = await reader.read(); if (done) break; const chunk = Buffer.from(value); completionText += chunk.toString('utf8'); res.write(chunk) }
       const estimated = estimateTokens(payload.messages) + estimateTokens(completionText); req.apiKey.tokenUsed += estimated; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, tokens: estimated, createdAt: new Date().toISOString() }); await saveDb(); res.end(); return
     }
     const data = await readChatResponse(upstream), used = Number(data.usage?.total_tokens || estimateTokens(payload.messages) + estimateTokens(data.choices?.[0]?.message?.content || ''))
     req.apiKey.tokenUsed += used; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, tokens: used, createdAt: new Date().toISOString() }); await saveDb()
-    data.model = 'DTEmpire'; data.dtempire = { tier }; res.setHeader('X-DTEmpire-Tier', tier); res.json(data)
+    data.model = 'DTEmpire'; data.dtempire = { tier, model: TIER_MODELS[tier], requested_tier: requestedTier }; res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', TIER_MODELS[tier]); res.json(data)
   } catch (error) { console.error(error); res.status(502).json({ error: { message: 'OmniRoute is unavailable.', type: 'upstream_error' } }) }
 })
 

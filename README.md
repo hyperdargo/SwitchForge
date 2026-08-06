@@ -94,11 +94,13 @@ curl http://localhost:6010/v1/chat/completions \
   -d '{"model":"DTEmpire","tier":"free","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-Use premium routing by changing the tier:
+By default, SwitchForge uses `auto`: coding and programming prompts route to Premium, while ordinary chat routes to Normal Chat. You can override the decision explicitly. Use premium routing by changing the tier:
 
 ```json
 {"model":"DTEmpire","tier":"premium","messages":[{"role":"user","content":"Review this architecture"}]}
 ```
+
+For example, a coding request such as `print("helloworld")` should resolve to Premium when `tier` is omitted. Inspect the response field `dtempire.model`, `dtempire.tier`, or the `X-SwitchForge-Route-Model` response header to see the resolved route.
 
 Inspect the current key allowance:
 
