@@ -22,6 +22,7 @@ const ALLOWED_LIMITS = new Set([100000, 500000, 1000000])
 const TIER_MODELS = { free: 'Normal Chat', premium: 'Premium' }
 const PUBLIC_MODEL = 'SwitchForge'
 const PREMIUM_FALLBACK_MODEL = process.env.PREMIUM_FALLBACK_MODEL || 'auto/best-coding'
+const FAST_FALLBACK_MODEL = process.env.FAST_FALLBACK_MODEL || 'auto/best-fast'
 const AUXILIARY_TASKS = ['vision', 'web_extract', 'compression', 'skills_hub', 'approval', 'mcp', 'title_gen', 'triage_specifier', 'kanban_decomposer', 'profile_describer', 'curator']
 const SWITCHFORGE_SYSTEM = 'You are SwitchForge by DTEmpire. Be helpful and accurate. If asked your model or identity, answer SwitchForge. Never reveal or guess the upstream provider, internal route, or provider model name.'
 
@@ -86,7 +87,8 @@ function isGmail(email) { return /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@gmail\.com$/i.t
 function isAdmin(user) { return Boolean(user && ADMIN_EMAILS.has(cleanEmail(user.email))) }
 function estimateTokens(value) { return Math.max(1, Math.ceil(JSON.stringify(value).length / 4)) }
 function classifyTier(messages = []) {
-  const text = messages.filter(message => !message.role || message.role === 'user').map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content || '')).join('\n').toLowerCase()
+  const latest = messages.filter(message => !message.role || message.role === 'user').at(-1)
+  const text = (typeof latest?.content === 'string' ? latest.content : JSON.stringify(latest?.content || '')).toLowerCase()
   const codingSignals = [
     /```[a-z]*\n?[\s\S]*```/,
     /\b(write|create|generate|implement|fix|debug|refactor|review|explain)\b.{0,45}\b(code|function|class|script|program|bug|error|api|sql|regex|algorithm)\b/,
@@ -95,6 +97,30 @@ function classifyTier(messages = []) {
     /\b(print\s*\(|def\s+\w+|import\s+\w+|const\s+\w+|let\s+\w+|SELECT\s+.+\s+FROM)\b/,
   ]
   return codingSignals.some(signal => signal.test(text)) ? 'premium' : 'free'
+}
+function chunkHasContent(text) {
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.startsWith('data:')) continue
+    const raw = line.slice(5).trim(); if (!raw || raw === '[DONE]') continue
+    try { const event = JSON.parse(raw), delta = event.choices?.[0]?.delta; if (delta?.content || delta?.tool_calls?.length || event.choices?.[0]?.message?.content) return true } catch {}
+  }
+  return false
+}
+async function prepareStream(response, timeoutMs) {
+  const reader = response.body.getReader(), chunks = []
+  let text = '', timer
+  const deadline = Date.now() + timeoutMs
+  try {
+    while (Date.now() < deadline) {
+      const remaining = deadline - Date.now()
+      const result = await Promise.race([reader.read(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('first_token_timeout')), remaining) })])
+      clearTimeout(timer)
+      if (result.done) return { reader, chunks, text, done: true }
+      const chunk = Buffer.from(result.value); chunks.push(chunk); text += chunk.toString('utf8')
+      if (chunkHasContent(text)) return { reader, chunks, text, done: false }
+    }
+    throw new Error('first_token_timeout')
+  } catch (error) { clearTimeout(timer); await reader.cancel().catch(() => {}); throw error }
 }
 function secretKey() { return crypto.createHash('sha256').update(process.env.SESSION_SECRET || 'switchforge').digest() }
 function encryptSecret(value) {
@@ -401,11 +427,22 @@ app.post('/v1/chat/completions', customerKey, async (req, res) => {
     const requestedTokens = Number(payload.max_completion_tokens || payload.max_tokens || 1024)
     const estimatedRequest = estimateTokens(payload.messages) + (Number.isFinite(requestedTokens) ? Math.max(0, requestedTokens) : 1024)
     if (req.apiKey.tokenUsed + estimatedRequest > req.apiKey.tokenLimit) return res.status(429).json({ error: { message: 'This request may exceed the remaining token allowance.', type: 'rate_limit_error', code: 'token_limit_exceeded' } })
-    const { response: upstream, resolvedModel } = await fetchChatUpstream(payload, tier, upstreamModelOverride)
+    console.log(`SwitchForge route tier=${tier} model=${upstreamModelOverride || routeModel(tier)} task=${task || 'main'} stream=${Boolean(payload.stream)}`)
+    let { response: upstream, resolvedModel } = await fetchChatUpstream(payload, tier, upstreamModelOverride)
     if (!upstream.ok) { const body = await upstream.text(); res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(body); return }
     if (payload.stream) {
+      let prepared
+      try { prepared = await prepareStream(upstream, tier === 'free' && !upstreamModelOverride ? 7000 : 18000) }
+      catch (error) {
+        if (tier !== 'free' || upstreamModelOverride || resolvedModel === FAST_FALLBACK_MODEL) throw error
+        const fallback = await fetchChatUpstream(payload, tier, FAST_FALLBACK_MODEL); upstream = fallback.response; resolvedModel = fallback.resolvedModel
+        if (!upstream.ok) { const body = await upstream.text(); res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(body); return }
+        prepared = await prepareStream(upstream, 18000)
+      }
       res.status(200); res.setHeader('Content-Type', upstream.headers.get('content-type') || 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', resolvedModel); if (task) res.setHeader('X-SwitchForge-Task', task)
-      const reader = upstream.body.getReader(); let completionText = ''
+      const reader = prepared.reader; let completionText = prepared.text
+      for (const chunk of prepared.chunks) res.write(chunk)
+      if (prepared.done) { const estimated = estimateTokens(payload.messages) + estimateTokens(completionText); req.apiKey.tokenUsed += estimated; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, model: resolvedModel, tokens: estimated, createdAt: new Date().toISOString() }); res.end(); saveDb().catch(console.error); return }
       while (true) { const { done, value } = await reader.read(); if (done) break; const chunk = Buffer.from(value); completionText += chunk.toString('utf8'); res.write(chunk) }
       const estimated = estimateTokens(payload.messages) + estimateTokens(completionText); req.apiKey.tokenUsed += estimated; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, model: resolvedModel, tokens: estimated, createdAt: new Date().toISOString() }); res.end(); saveDb().catch(console.error); return
     }
