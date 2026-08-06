@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import {
   ArrowRight, BarChart3, BookOpen, Check, CheckCircle2, ChevronDown,
   Clock3, Copy, Eye, EyeOff, KeyRound, Layers3, LogOut, Menu, Plus,
-  RotateCcw, Save, Search, ServerCog, Settings, ShieldCheck, Sparkles, Trash2, X, Zap
+  RotateCcw, Save, ServerCog, Settings, ShieldCheck, Sparkles, Trash2, X, Zap
 } from 'lucide-react'
 import './styles.css'
 
@@ -224,7 +224,7 @@ function Dashboard({ user, onLogout, onDocs }) {
   return <div className="app-shell">
     <aside><Brand/><button className="workspace" onClick={()=>setSettingsOpen(true)} title="Open account settings"><div>{user.name.slice(0,2).toUpperCase()}</div><span><small>{user.role==='admin'?'ADMIN WORKSPACE':'PERSONAL WORKSPACE'}</small>{user.name}'s workspace</span><ChevronDown/></button><nav><p>PLATFORM</p><a className={view==='overview'?'active':''} onClick={()=>setView('overview')}><Layers3/>Overview</a><a onClick={showKeys}><KeyRound/>API keys<span>{keys.length}</span></a><a className={view==='usage'?'active':''} onClick={()=>setView('usage')}><BarChart3/>Usage</a><p>DEVELOPERS</p><a onClick={onDocs}><BookOpen/>Documentation<ArrowRight/></a><a onClick={()=>setSettingsOpen(true)}><Settings/>Settings</a>{user.role==='admin'&&<><p>ADMIN</p><a onClick={()=>setAdminSection('gateway')}><ServerCog/>Gateway control<ArrowRight/></a><a onClick={()=>setAdminSection('users')}><BarChart3/>Users & usage<ArrowRight/></a></>}</nav><div className="side-bottom"><div><span className="status-dot"/>All systems operational</div><small>&copy; {new Date().getFullYear()} DargoTamber (DTEmpire)</small><button onClick={onLogout}><LogOut/>Sign out</button></div></aside>
     <main className="dashboard">
-      <header><button className="mobile-menu"><Menu/></button><button className="search" onClick={onDocs} title="Open documentation"><Search/><span>Search documentation...</span><kbd>⌘ K</kbd></button><div className="header-right">{user.role==='admin'&&<button className="admin-header-btn" onClick={()=>setAdminSection('users')}><BarChart3/>Users</button>}<button className="docs-btn" onClick={onDocs}><BookOpen/>Docs</button><button className="avatar">{user.name.slice(0,2).toUpperCase()}</button></div></header>
+      <header><button className="mobile-menu"><Menu/></button><div className="header-right">{user.role==='admin'&&<button className="admin-header-btn" onClick={()=>setAdminSection('users')}><BarChart3/>Users</button>}<button className="docs-btn" onClick={onDocs}><BookOpen/>Docs</button><button className="avatar">{user.name.slice(0,2).toUpperCase()}</button></div></header>
       <div className="dash-body">{view==='usage'?<UsagePage/>:<>
         <div className="welcome"><div><div className="eyebrow"><span/> DEVELOPER CONSOLE</div><h1>Good morning, {user.name.split(' ')[0]}.</h1><p>Here's what's happening with your SwitchForge APIs.</p></div><button className="primary-btn" onClick={()=>isAdmin||keys.length<3?setModal(true):setToast('You can create a maximum of 3 API keys')}><Plus/>Create API key</button></div>
         <section className="stats-grid">
