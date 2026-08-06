@@ -5,7 +5,7 @@
 ![Node](https://img.shields.io/badge/Node.js-22-339933?style=flat-square&logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/status-early%20access-d9ae4c?style=flat-square)
 
-SwitchForge is an OpenAI-compatible model gateway for developers who want one stable endpoint with two routing levels:
+SwitchForge is an OpenAI-compatible model gateway for developers who want one stable endpoint with two routing levels. Its provider settings accept OmniRoute or another compatible `/v1` endpoint:
 
 - **Free / Normal Chat** for everyday questions, rewriting, summaries, and lightweight work.
 - **Premium / Premium** for coding, difficult reasoning, and tasks that need stronger model capability.

@@ -362,7 +362,7 @@ app.put('/api/admin/gateway', auth, adminOnly, async (req, res) => {
   const freeModel = String(req.body.freeModel || '').trim(), premiumModel = String(req.body.premiumModel || '').trim(), apiKey = String(req.body.apiKey || '').trim()
   const auxiliary = Object.fromEntries(AUXILIARY_TASKS.map(task => [task, String(req.body.auxiliary?.[task] || 'auto').trim().slice(0, 160) || 'auto']))
   try { const parsed = new URL(baseUrl); if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error() }
-  catch { return res.status(400).json({ error: { message: 'Enter a valid OmniRoute HTTP or HTTPS base URL.' } }) }
+  catch { return res.status(400).json({ error: { message: 'Enter a valid provider HTTP or HTTPS base URL.' } }) }
   if (!freeModel || !premiumModel || freeModel.length > 120 || premiumModel.length > 120) return res.status(400).json({ error: { message: 'Enter valid free and premium model names.' } })
   const previous = db.settings?.gateway || {}
   db.settings ||= {}; db.settings.gateway = { ...previous, baseUrl, freeModel, premiumModel, auxiliary, updatedAt: new Date().toISOString(), updatedBy: req.user.id }
@@ -377,13 +377,13 @@ app.post('/api/admin/gateway/test', auth, adminOnly, async (req, res) => {
     const apiKey = String(req.body.apiKey || '').trim() || saved.apiKey
     const parsed = new URL(baseUrl)
     if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('invalid_url')
-    if (!apiKey) return res.status(400).json({ error: { message: 'Enter an OmniRoute API key before testing.' } })
+    if (!apiKey) return res.status(400).json({ error: { message: 'Enter a provider API key before testing.' } })
     const response = await fetch(`${baseUrl}/models`, upstreamOptions({ headers: { Authorization: `Bearer ${apiKey}` } }))
-    if (!response.ok) return res.status(502).json({ error: { message: `OmniRoute returned HTTP ${response.status}.` } })
+    if (!response.ok) return res.status(502).json({ error: { message: `The provider returned HTTP ${response.status}.` } })
     const data = await response.json()
     const models = [...new Set((Array.isArray(data.data) ? data.data : []).map(model => typeof model === 'string' ? model : model?.id).filter(Boolean))].sort((a, b) => a.localeCompare(b))
     res.json({ ok: true, count: models.length, models })
-  } catch { res.status(502).json({ error: { message: 'Could not connect to OmniRoute with this URL and API key.' } }) }
+  } catch { res.status(502).json({ error: { message: 'Could not connect to the provider with this URL and API key.' } }) }
 })
 
 app.get('/api/admin/users', auth, adminOnly, (_req, res) => {
@@ -511,7 +511,7 @@ app.post('/v1/chat/completions', customerKey, async (req, res) => {
     data.model = PUBLIC_MODEL; data.switchforge = { tier, model: resolvedModel, requested_tier: requestedTier, premium_access: premiumAllowed, task: task || null }; data.dtempire = data.switchforge; res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', resolvedModel); if (task) res.setHeader('X-SwitchForge-Task', task); res.json(data); saveDb().catch(console.error)
   } catch (error) {
     console.error(error)
-    if (!res.headersSent) res.status(502).json({ error: { message: 'OmniRoute is unavailable.', type: 'upstream_error' } })
+    if (!res.headersSent) res.status(502).json({ error: { message: 'The configured model provider is unavailable.', type: 'upstream_error' } })
     else if (!res.writableEnded) { res.write(`data: ${JSON.stringify({ error: { message: 'The upstream stream ended unexpectedly.', type: 'upstream_error' } })}\n\ndata: [DONE]\n\n`); res.end() }
   }
 })
