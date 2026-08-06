@@ -19,12 +19,16 @@ const session = {
 async function api(path, options = {}) {
   const response = await fetch(`/api${path}`, { ...options, headers: { 'Content-Type': 'application/json', ...(session.get() ? { Authorization: `Bearer ${session.get()}` } : {}), ...options.headers } })
   const data = response.status === 204 ? null : await response.json().catch(() => null)
-  if (!response.ok) throw new Error(data?.error?.message || 'Something went wrong. Please try again.')
+  if (!response.ok) { const error = new Error(data?.error?.message || 'Something went wrong. Please try again.'); error.code = data?.error?.code; if (error.code === 'account_suspended') window.dispatchEvent(new CustomEvent('switchforge:suspended')); throw error }
   return data
 }
 
 function Brand() {
   return <a className="brand" href="/" title="SwitchForge by DTEmpire home"><div className="brand-mark"><img src="/dtempire-logo.png" alt=""/></div><span>Switch<span>Forge</span><small>BY DTEMPIRE</small></span></a>
+}
+
+function SuspendedPage({ onLogout }) {
+  return <div className="suspended-page"><div className="suspended-card"><div className="card-icon"><ShieldCheck/></div><div className="eyebrow"><span/> ACCOUNT ACCESS PAUSED</div><h1>Your account is suspended</h1><p>Access to your SwitchForge dashboard, API keys, and services has been paused by an administrator.</p><div className="suspended-note"><ShieldCheck/><span>Please contact the SwitchForge administration team and ask them to restore your account. Your data and usage history are preserved.</span></div><button className="primary-btn" onClick={onLogout}><LogOut/>Sign out</button></div></div>
 }
 
 function Auth({ onAuthed, onDocs }) {
@@ -247,11 +251,12 @@ function Dashboard({ user, onLogout, onDocs }) {
 
 function App(){
   const [user,setUser]=useState(null), [checking,setChecking]=useState(Boolean(session.get()))
+  const [suspended,setSuspended]=useState(false)
   const [docs,setDocs]=useState(false)
-  useEffect(()=>{if(!session.get())return;api('/auth/me').then(data=>setUser(data.user)).catch(()=>session.clear()).finally(()=>setChecking(false))},[])
+  useEffect(()=>{const handler=()=>setSuspended(true);window.addEventListener('switchforge:suspended',handler);if(!session.get()){setChecking(false);return()=>window.removeEventListener('switchforge:suspended',handler)}api('/auth/me').then(data=>setUser(data.user)).catch(err=>{if(err.code==='account_suspended')setSuspended(true);else session.clear()}).finally(()=>setChecking(false));return()=>window.removeEventListener('switchforge:suspended',handler)},[])
   const logout=async()=>{try{await api('/auth/logout',{method:'POST'})}catch{}session.clear();setUser(null)}
   if(checking)return <div className="boot"><Brand/><span>Loading console...</span></div>
-  return <>{user?<Dashboard user={user} onLogout={logout} onDocs={()=>setDocs(true)}/>:<Auth onAuthed={setUser} onDocs={()=>setDocs(true)}/>} {docs&&<Documentation onClose={()=>setDocs(false)}/>}</>
+  return <>{suspended?<SuspendedPage onLogout={logout}/>:user?<Dashboard user={user} onLogout={logout} onDocs={()=>setDocs(true)}/>:<Auth onAuthed={setUser} onDocs={()=>setDocs(true)}/>} {docs&&!suspended&&<Documentation onClose={()=>setDocs(false)}/>}</>
 }
 
 createRoot(document.getElementById('root')).render(<App/>)
