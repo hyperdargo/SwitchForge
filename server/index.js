@@ -91,8 +91,10 @@ function classifyTier(messages = []) {
   const text = (typeof latest?.content === 'string' ? latest.content : JSON.stringify(latest?.content || '')).toLowerCase()
   const codingSignals = [
     /```[a-z]*\n?[\s\S]*```/,
-    /\b(write|create|generate|implement|fix|debug|refactor|review|explain)\b.{0,45}\b(code|function|class|script|program|bug|error|api|sql|regex|algorithm)\b/,
+    /\b(write|creat(?:e|ing)?|cret(?:e|ea)|generate|implement|build|make|fix|debug|refactor|review|explain)\b.{0,80}\b(code|function|class|script|program|app|website|page|component|button|bug|error|api|sql|regex|algorithm|html|css|react)\b/,
     /\b(how (?:do|can) i|show me how to)\b.{0,50}\b(python|javascript|typescript|java|rust|golang|c\+\+|html|css|react|node(?:\.js)?|code|program)\b/,
+    /\b(react|next(?:\.js)?|vue|svelte|angular|html|css|javascript|typescript|python|node(?:\.js)?)\b.{0,100}\b(app|website|page|component|button|form|api|code|function|script)\b/,
+    /\b(app|website|web ?page|component|button|form)\b.{0,100}\b(react|html|css|javascript|typescript|code)\b/,
     /\b(debug|stack trace|syntax error|runtime error|compile error|coding task|programming task)\b/,
     /\b(print\s*\(|def\s+\w+|import\s+\w+|const\s+\w+|let\s+\w+|SELECT\s+.+\s+FROM)\b/,
   ]
