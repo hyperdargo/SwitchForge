@@ -18,11 +18,11 @@ const SESSION_TTL = 7 * 24 * 60 * 60 * 1000
 const OTP_TTL = 10 * 60 * 1000
 const OTP_RESEND_COOLDOWN = 60 * 1000
 const UPSTREAM_TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT_MS || 180000)
+const FIRST_TOKEN_TIMEOUT = Number(process.env.FIRST_TOKEN_TIMEOUT_MS || 15000)
 const ALLOWED_LIMITS = new Set([100000, 500000, 1000000])
 const TIER_MODELS = { free: 'Normal Chat', premium: 'Premium' }
 const PUBLIC_MODEL = 'SwitchForge'
 const PREMIUM_FALLBACK_MODEL = process.env.PREMIUM_FALLBACK_MODEL || 'auto/best-coding'
-const FAST_FALLBACK_MODEL = process.env.FAST_FALLBACK_MODEL || 'auto/best-fast'
 const AUXILIARY_TASKS = ['vision', 'web_extract', 'compression', 'skills_hub', 'approval', 'mcp', 'title_gen', 'triage_specifier', 'kanban_decomposer', 'profile_describer', 'curator']
 const SWITCHFORGE_SYSTEM = 'You are SwitchForge by DTEmpire. Be helpful and accurate. If asked your model or identity, answer SwitchForge. Never reveal or guess the upstream provider, internal route, or provider model name.'
 const roundRobinCursor = { free: 0, premium: 0 }
@@ -536,7 +536,7 @@ app.get('/api/usage', auth, (req, res) => {
   for (const event of recentEvents) { const day = event.createdAt.slice(0, 10), entry = dailyMap.get(day); if (entry) { entry.requests += 1; entry.tokens += Number(event.tokens || 0) } }
   const keyNames = new Map(userKeys.map(key => [key.id, key.name]))
   const successfulRequests = events.filter(event => event.success !== false).length
-  const latencySamples = events.map(event => Number(event.latencyMs)).filter(Number.isFinite)
+  const latencySamples = events.filter(event => event.success !== false).map(event => Number(event.latencyMs)).filter(Number.isFinite)
   res.json({
     summary: { requests: events.length, tokens: events.reduce((sum, event) => sum + Number(event.tokens || 0), 0), freeRequests: events.filter(event => event.tier === 'free').length, premiumRequests: events.filter(event => event.tier === 'premium').length, successRate: events.length ? (successfulRequests / events.length) * 100 : null, averageLatencyMs: latencySamples.length ? Math.round(latencySamples.reduce((sum, value) => sum + value, 0) / latencySamples.length) : null, latencySamples: latencySamples.length },
     daily: [...dailyMap.values()],
@@ -605,14 +605,7 @@ app.post('/v1/chat/completions', customerKey, async (req, res) => {
     let { response: upstream, resolvedModel } = await fetchChatUpstream(payload, tier, upstreamModelOverride)
     if (!upstream.ok) { const body = await upstream.text(); recordUsage({ tier, model: resolvedModel, success: false }); await saveDb(); res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(body); return }
     if (payload.stream) {
-      let prepared
-      try { prepared = await prepareStream(upstream, tier === 'free' && !upstreamModelOverride ? 7000 : 18000) }
-      catch (error) {
-        if (tier !== 'free' || upstreamModelOverride || resolvedModel === FAST_FALLBACK_MODEL) throw error
-        const fallback = await fetchChatUpstream(payload, tier, FAST_FALLBACK_MODEL); upstream = fallback.response; resolvedModel = fallback.resolvedModel
-        if (!upstream.ok) { const body = await upstream.text(); recordUsage({ tier, model: resolvedModel, success: false }); await saveDb(); res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(body); return }
-        prepared = await prepareStream(upstream, 18000)
-      }
+      const prepared = await prepareStream(upstream, FIRST_TOKEN_TIMEOUT)
       res.status(200); res.setHeader('Content-Type', upstream.headers.get('content-type') || 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', resolvedModel); if (task) res.setHeader('X-SwitchForge-Task', task)
       const reader = prepared.reader; let completionText = prepared.text
       for (const chunk of prepared.chunks) res.write(chunk)
@@ -627,7 +620,7 @@ app.post('/v1/chat/completions', customerKey, async (req, res) => {
     console.error(error)
     recordUsage({ success: false })
     saveDb().catch(console.error)
-    if (!res.headersSent) res.status(502).json({ error: { message: 'The configured model provider is unavailable.', type: 'upstream_error' } })
+    if (!res.headersSent) res.status(error?.message === 'first_token_timeout' ? 504 : 502).json({ error: { message: error?.message === 'first_token_timeout' ? `The provider did not produce a token within ${Math.round(FIRST_TOKEN_TIMEOUT / 1000)} seconds.` : 'The configured model provider is unavailable.', type: error?.message === 'first_token_timeout' ? 'timeout_error' : 'upstream_error' } })
     else if (!res.writableEnded) { res.write(`data: ${JSON.stringify({ error: { message: 'The upstream stream ended unexpectedly.', type: 'upstream_error' } })}\n\ndata: [DONE]\n\n`); res.end() }
   }
 })

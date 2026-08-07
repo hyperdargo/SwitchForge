@@ -1947,7 +1947,7 @@ function Dashboard({ user, onLogout, onDocs }) {
                   </strong>
                   <p>
                     {usage?.summary.latencySamples
-                      ? `Across ${usage.summary.latencySamples.toLocaleString()} measured requests`
+                      ? `Across ${usage.summary.latencySamples.toLocaleString()} successful requests`
                       : "Timing starts with the next request"}
                   </p>
                 </div>
