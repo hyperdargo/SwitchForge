@@ -1086,6 +1086,7 @@ function AdminPanel({ onClose, initialTab = "gateway" }) {
   const removeProvider = (providerId) => setConfig((current) => ({ ...current, providers: current.providers.filter((provider) => provider.id !== providerId), routes: { free: { ...current.routes.free, providerIds: current.routes.free.providerIds.filter((id) => id !== providerId) }, premium: { ...current.routes.premium, providerIds: current.routes.premium.providerIds.filter((id) => id !== providerId) } } }));
   const toggleRouteProvider = (tier, providerId) => setConfig((current) => { const selected = current.routes[tier].providerIds.includes(providerId); return { ...current, routes: { ...current.routes, [tier]: { ...current.routes[tier], providerIds: selected ? current.routes[tier].providerIds.filter((id) => id !== providerId) : [...current.routes[tier].providerIds, providerId] } } }; });
   const refreshOauth = () => api("/admin/oauth").then(setOauth);
+  const refreshGateway = () => api("/admin/gateway").then((data) => setConfig(data.gateway));
   const startOauth = async (provider) => {
     setBusy(true); setMessage(""); setOauthCallback("");
     try {
@@ -1102,7 +1103,8 @@ function AdminPanel({ onClose, initialTab = "gateway" }) {
         const status = await api(`/admin/oauth/${provider.id}/status?state=${encodeURIComponent(state)}`);
         if (["complete", "completed", "authorized"].includes(status.status)) {
           await api(`/admin/oauth/${provider.id}/apply`, { method: "POST", body: JSON.stringify({ state }) });
-          setMessage(`${provider.name} connected.`); setOauthFlow(null); await refreshOauth(); return;
+          await api(`/admin/oauth/${provider.id}/register`, { method: "POST", body: JSON.stringify({}) });
+          setMessage(`${provider.name} connected and added to the provider router.`); setOauthFlow(null); await Promise.all([refreshOauth(), refreshGateway()]); return;
         }
         if (["error", "failed"].includes(status.status)) throw new Error(status.error || "Authorization failed.");
       } catch (err) { setMessage(err.message); return; }
@@ -1112,7 +1114,8 @@ function AdminPanel({ onClose, initialTab = "gateway" }) {
   const exchangeOauth = async () => {
     try {
       await api(`/admin/oauth/${oauthFlow.provider.id}/exchange`, { method: "POST", body: JSON.stringify({ callback: oauthCallback, state: oauthFlow.state, redirectUri: oauthFlow.redirectUri, codeVerifier: oauthFlow.codeVerifier }) });
-      setMessage(`${oauthFlow.provider.name} connected.`); setOauthFlow(null); setOauthCallback(""); await refreshOauth();
+      await api(`/admin/oauth/${oauthFlow.provider.id}/register`, { method: "POST", body: JSON.stringify({}) });
+      setMessage(`${oauthFlow.provider.name} connected and added to the provider router.`); setOauthFlow(null); setOauthCallback(""); await Promise.all([refreshOauth(), refreshGateway()]);
     } catch (err) { setMessage(err.message); }
   };
   return (

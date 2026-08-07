@@ -456,6 +456,18 @@ app.post('/api/admin/oauth/:provider/exchange', auth, adminOnly, async (req, res
   try { return proxyOmniJson(res, await omniManagementFetch(`/api/oauth/${provider.id}/exchange`, { method: 'POST', body: { code, state, redirectUri: req.body.redirectUri, codeVerifier: req.body.codeVerifier } })) }
   catch { res.status(502).json({ error: { message: 'OAuth code exchange failed.' } }) }
 })
+app.post('/api/admin/oauth/:provider/register', auth, adminOnly, async (req, res) => {
+  const defaults = { antigravity: ['Google Antigravity', 'antigravity/gemini-3.6-flash-high'], gemini: ['Google Gemini OAuth', 'auto/gemini'], 'claude-code': ['Claude Code OAuth', 'cc/claude-sonnet-4-6'], codex: ['OpenAI Codex OAuth', 'codex/auto'], copilot: ['GitHub Copilot OAuth', 'copilot/auto'] }
+  const [name, model] = defaults[req.params.provider] || []
+  if (!name) return res.status(400).json({ error: { message: 'Unsupported OAuth provider.' } })
+  const config = gatewayConfig(), saved = db.settings?.gateway || {}, providers = Array.isArray(saved.providers) && saved.providers.length ? [...saved.providers] : config.providers.map(provider => ({ ...provider, apiKeyEncrypted: provider.apiKey ? encryptSecret(provider.apiKey) : undefined }))
+  const providerId = `oauth-${req.params.provider}`, existing = providers.findIndex(provider => provider.id === providerId), entry = { id: providerId, name, baseUrl: config.baseUrl, model, premiumModel: model, timeoutMs: 60000, apiKeyEncrypted: config.apiKey ? encryptSecret(config.apiKey) : undefined }
+  if (existing >= 0) providers[existing] = { ...providers[existing], ...entry }; else providers.push(entry)
+  const ids = new Set(providers.map(provider => provider.id)), priorRoutes = config.routes
+  const routes = { free: { strategy: priorRoutes.free.strategy, providerIds: [...new Set([...priorRoutes.free.providerIds, providerId])].filter(id => ids.has(id)) }, premium: { strategy: priorRoutes.premium.strategy, providerIds: [...new Set([...priorRoutes.premium.providerIds, providerId])].filter(id => ids.has(id)) } }
+  db.settings ||= {}; db.settings.gateway = { ...saved, providers, routes, updatedAt: new Date().toISOString(), updatedBy: req.user.id }; await saveDb()
+  res.json({ provider: { ...entry, apiKeyEncrypted: undefined }, routes })
+})
 app.get('/api/admin/oauth/:provider/status', auth, adminOnly, async (req, res) => {
   const provider = OAUTH_PROVIDERS.find(item => item.id === req.params.provider && item.flow === 'device')
   if (!provider) return res.status(400).json({ error: { message: 'Unsupported device flow.' } })
