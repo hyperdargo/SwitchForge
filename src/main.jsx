@@ -923,6 +923,9 @@ function AdminPanel({ onClose, initialTab = "gateway" }) {
     [config, setConfig] = useState(null),
     [apiKey, setApiKey] = useState(""),
     [models, setModels] = useState([]),
+    [oauth, setOauth] = useState({ providers: [], connections: [] }),
+    [oauthFlow, setOauthFlow] = useState(null),
+    [oauthCallback, setOauthCallback] = useState(""),
     [users, setUsers] = useState([]),
     [busy, setBusy] = useState(false),
     [message, setMessage] = useState("");
@@ -932,6 +935,9 @@ function AdminPanel({ onClose, initialTab = "gateway" }) {
       .catch((err) => setMessage(err.message));
     api("/admin/users")
       .then((data) => setUsers(data.users))
+      .catch((err) => setMessage(err.message));
+    api("/admin/oauth")
+      .then(setOauth)
       .catch((err) => setMessage(err.message));
   }, []);
   const update = (field, value) =>
@@ -947,6 +953,8 @@ function AdminPanel({ onClose, initialTab = "gateway" }) {
           freeModel: config.freeModel,
           premiumModel: config.premiumModel,
           auxiliary: config.auxiliary,
+          providers: config.providers,
+          routes: config.routes,
           apiKey,
         }),
       });
@@ -1060,6 +1068,55 @@ function AdminPanel({ onClose, initialTab = "gateway" }) {
     }
   };
   const options = (value) => [...new Set([value, ...models].filter(Boolean))];
+  const updateProvider = (providerId, field, value) =>
+    setConfig((current) => ({
+      ...current,
+      providers: current.providers.map((provider) =>
+        provider.id === providerId ? { ...provider, [field]: value } : provider,
+      ),
+    }));
+  const addProvider = () => {
+    const providerId = crypto.randomUUID();
+    setConfig((current) => ({
+      ...current,
+      providers: [...current.providers, { id: providerId, name: "New provider", baseUrl: "https://website.com/v1", model: "model-name", premiumModel: "model-name", timeoutMs: 60000, apiKey: "", apiKeyConfigured: false }],
+      routes: { ...current.routes, free: { ...current.routes.free, providerIds: [...current.routes.free.providerIds, providerId] }, premium: { ...current.routes.premium, providerIds: [...current.routes.premium.providerIds, providerId] } },
+    }));
+  };
+  const removeProvider = (providerId) => setConfig((current) => ({ ...current, providers: current.providers.filter((provider) => provider.id !== providerId), routes: { free: { ...current.routes.free, providerIds: current.routes.free.providerIds.filter((id) => id !== providerId) }, premium: { ...current.routes.premium, providerIds: current.routes.premium.providerIds.filter((id) => id !== providerId) } } }));
+  const toggleRouteProvider = (tier, providerId) => setConfig((current) => { const selected = current.routes[tier].providerIds.includes(providerId); return { ...current, routes: { ...current.routes, [tier]: { ...current.routes[tier], providerIds: selected ? current.routes[tier].providerIds.filter((id) => id !== providerId) : [...current.routes[tier].providerIds, providerId] } } }; });
+  const refreshOauth = () => api("/admin/oauth").then(setOauth);
+  const startOauth = async (provider) => {
+    setBusy(true); setMessage(""); setOauthCallback("");
+    try {
+      const data = await api(`/admin/oauth/${provider.id}/start`, { method: "POST", body: JSON.stringify({}) });
+      const flow = { ...data, provider };
+      setOauthFlow(flow);
+      const target = data.authUrl || data.authorizeUrl || data.verificationUri || data.verification_uri_complete || data.verification_uri;
+      if (target) window.open(target, "switchforge_oauth", "noopener,noreferrer");
+      if (provider.flow === "device" && data.state) pollOauth(provider, data.state);
+    } catch (err) { setMessage(err.message); } finally { setBusy(false); }
+  };
+  const pollOauth = async (provider, state) => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      try {
+        const status = await api(`/admin/oauth/${provider.id}/status?state=${encodeURIComponent(state)}`);
+        if (["complete", "completed", "authorized"].includes(status.status)) {
+          await api(`/admin/oauth/${provider.id}/apply`, { method: "POST", body: JSON.stringify({ state }) });
+          setMessage(`${provider.name} connected.`); setOauthFlow(null); await refreshOauth(); return;
+        }
+        if (["error", "failed"].includes(status.status)) throw new Error(status.error || "Authorization failed.");
+      } catch (err) { setMessage(err.message); return; }
+    }
+    setMessage("OAuth authorization timed out.");
+  };
+  const exchangeOauth = async () => {
+    try {
+      await api(`/admin/oauth/${oauthFlow.provider.id}/exchange`, { method: "POST", body: JSON.stringify({ callback: oauthCallback, state: oauthFlow.state, redirectUri: oauthFlow.redirectUri, codeVerifier: oauthFlow.codeVerifier }) });
+      setMessage(`${oauthFlow.provider.name} connected.`); setOauthFlow(null); setOauthCallback(""); await refreshOauth();
+    } catch (err) { setMessage(err.message); }
+  };
   return (
     <div className="modal-bg admin-bg">
       <div className="admin-panel">
@@ -1165,6 +1222,54 @@ function AdminPanel({ onClose, initialTab = "gateway" }) {
                 </select>
                 <small>Available only to users granted Premium access.</small>
               </label>
+            </div>
+            <div className="provider-router-head">
+              <div>
+                <h3>Provider router</h3>
+                <p>Add OpenAI-compatible <code>/v1</code> providers and assign them to Normal or Premium traffic.</p>
+              </div>
+              <button className="secondary-btn" onClick={addProvider}><Plus />Add provider</button>
+            </div>
+            <div className="route-strategies">
+              {[["free", "Normal"], ["premium", "Premium"]].map(([tier, label]) => (
+                <label key={tier}>{label} routing<select value={config.routes[tier].strategy} onChange={(e) => setConfig((current) => ({ ...current, routes: { ...current.routes, [tier]: { ...current.routes[tier], strategy: e.target.value } } }))}><option value="fallback">Ordered fallback</option><option value="round_robin">Round robin</option></select></label>
+              ))}
+            </div>
+            <div className="provider-list">
+              {config.providers.map((provider, index) => (
+                <div className="provider-card" key={provider.id}>
+                  <div className="provider-card-head"><b>{index + 1}. {provider.name || "Provider"}</b><button disabled={config.providers.length === 1} onClick={() => removeProvider(provider.id)} title="Remove provider"><Trash2 /></button></div>
+                  <div className="provider-grid">
+                    <label>Name<input value={provider.name} onChange={(e) => updateProvider(provider.id, "name", e.target.value)} /></label>
+                    <label>Base URL<input value={provider.baseUrl} onChange={(e) => updateProvider(provider.id, "baseUrl", e.target.value)} placeholder="https://website.com/v1" /></label>
+                    <label>Normal model<input value={provider.model} onChange={(e) => updateProvider(provider.id, "model", e.target.value)} /></label>
+                    <label>Premium model<input value={provider.premiumModel || ""} onChange={(e) => updateProvider(provider.id, "premiumModel", e.target.value)} /></label>
+                    <label>API key<input type="password" value={provider.apiKey || ""} onChange={(e) => updateProvider(provider.id, "apiKey", e.target.value)} placeholder={provider.apiKeyConfigured ? "Saved — leave blank to keep" : "Required"} /></label>
+                    <label>Timeout (ms)<input type="number" min="5000" max="180000" step="1000" value={provider.timeoutMs || 60000} onChange={(e) => updateProvider(provider.id, "timeoutMs", Number(e.target.value))} /></label>
+                  </div>
+                  <div className="provider-assign"><label><input type="checkbox" checked={config.routes.free.providerIds.includes(provider.id)} onChange={() => toggleRouteProvider("free", provider.id)} /> Normal</label><label><input type="checkbox" checked={config.routes.premium.providerIds.includes(provider.id)} onChange={() => toggleRouteProvider("premium", provider.id)} /> Premium</label></div>
+                </div>
+              ))}
+            </div>
+            <div className="oauth-router">
+              <div className="provider-router-head">
+                <div><h3>Account connections</h3><p>Connect supported subscriptions through OmniRoute OAuth. Credentials stay inside OmniRoute.</p></div>
+              </div>
+              <div className="oauth-provider-grid">
+                {oauth.providers.map((provider) => (
+                  <button key={provider.id} className="oauth-provider" disabled={busy} onClick={() => startOauth(provider)}>
+                    <span><b>{provider.name}</b><small>{provider.flow === "device" ? "Device authorization" : "Browser authorization"}</small></span><ArrowRight />
+                  </button>
+                ))}
+              </div>
+              {oauthFlow && (
+                <div className="oauth-flow">
+                  <b>Connect {oauthFlow.provider.name}</b>
+                  {(oauthFlow.userCode || oauthFlow.user_code) && <p>Enter code <code>{oauthFlow.userCode || oauthFlow.user_code}</code> in the opened page.</p>}
+                  {oauthFlow.provider.flow === "browser" && <><p>After approval, paste the complete callback URL or <code>code#state</code>.</p><textarea value={oauthCallback} onChange={(e) => setOauthCallback(e.target.value)} placeholder="http://127.0.0.1:20128/callback?code=...&state=..." /><button className="primary-btn" disabled={!oauthCallback.trim()} onClick={exchangeOauth}>Complete connection</button></>}
+                </div>
+              )}
+              <p className="oauth-count">{oauth.connections.length} active OAuth connection{oauth.connections.length === 1 ? "" : "s"} in OmniRoute.</p>
             </div>
             <div className="aux-head">
               <div>
@@ -1611,6 +1716,7 @@ function Dashboard({ user, onLogout, onDocs }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [view, setView] = useState("overview");
   const [loading, setLoading] = useState(true);
+  const [usage, setUsage] = useState(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => window.innerWidth <= 900);
   const total = keys.reduce((a, k) => a + k.tokenUsed, 0);
   useEffect(() => {
@@ -1620,8 +1726,11 @@ function Dashboard({ user, onLogout, onDocs }) {
     }
   }, [toast]);
   useEffect(() => {
-    api("/keys")
-      .then((data) => setKeys(data.keys))
+    Promise.all([api("/keys"), api("/usage")])
+      .then(([keyData, usageData]) => {
+        setKeys(keyData.keys);
+        setUsage(usageData);
+      })
       .catch((err) => setToast(err.message))
       .finally(() => setLoading(false));
   }, []);
@@ -1812,9 +1921,15 @@ function Dashboard({ user, onLogout, onDocs }) {
                     </span>
                     <small>SUCCESS RATE</small>
                   </div>
-                  <strong>99.8%</strong>
+                  <strong>
+                    {usage?.summary.successRate == null
+                      ? "N/A"
+                      : `${usage.summary.successRate.toFixed(1)}%`}
+                  </strong>
                   <p>
-                    <b>↑ 0.4%</b> from last month
+                    {usage?.summary.requests
+                      ? `Across ${usage.summary.requests.toLocaleString()} recorded requests`
+                      : "No requests recorded yet"}
                   </p>
                 </div>
                 <div className="stat-card">
@@ -1825,9 +1940,16 @@ function Dashboard({ user, onLogout, onDocs }) {
                     <small>AVG. LATENCY</small>
                   </div>
                   <strong>
-                    642<em>ms</em>
+                    {usage?.summary.averageLatencyMs == null
+                      ? "N/A"
+                      : usage.summary.averageLatencyMs}
+                    {usage?.summary.averageLatencyMs != null && <em>ms</em>}
                   </strong>
-                  <p>Across 1,284 requests</p>
+                  <p>
+                    {usage?.summary.latencySamples
+                      ? `Across ${usage.summary.latencySamples.toLocaleString()} measured requests`
+                      : "Timing starts with the next request"}
+                  </p>
                 </div>
               </section>
               <section className="endpoint-card">
@@ -1845,10 +1967,23 @@ function Dashboard({ user, onLogout, onDocs }) {
                   </div>
                 </div>
                 <div className="endpoint-values">
-                  <div>
+                  <div className="endpoint-url-field">
                     <small>ENDPOINT</small>
-                    <code>{`${gatewayBase}/v1/chat/completions`}</code>
+                    <div
+                      className="endpoint-cube"
+                      aria-label={`${gatewayBase}/v1/chat/completions`}
+                    >
+                      <div className="endpoint-cube-inner">
+                        <code className="endpoint-face endpoint-face-base">
+                          {`${gatewayBase}/v1`}
+                        </code>
+                        <code className="endpoint-face endpoint-face-full">
+                          {`${gatewayBase}/v1/chat/completions`}
+                        </code>
+                      </div>
+                    </div>
                     <button
+                      aria-label="Copy chat completions endpoint"
                       onClick={() => copy(`${gatewayBase}/v1/chat/completions`)}
                     >
                       <Copy />

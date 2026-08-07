@@ -17,7 +17,7 @@ const ADMIN_EMAILS = new Set(String(process.env.ADMIN_EMAILS || '').split(',').m
 const SESSION_TTL = 7 * 24 * 60 * 60 * 1000
 const OTP_TTL = 10 * 60 * 1000
 const OTP_RESEND_COOLDOWN = 60 * 1000
-const UPSTREAM_TIMEOUT = 90 * 1000
+const UPSTREAM_TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT_MS || 180000)
 const ALLOWED_LIMITS = new Set([100000, 500000, 1000000])
 const TIER_MODELS = { free: 'Normal Chat', premium: 'Premium' }
 const PUBLIC_MODEL = 'SwitchForge'
@@ -25,6 +25,7 @@ const PREMIUM_FALLBACK_MODEL = process.env.PREMIUM_FALLBACK_MODEL || 'auto/best-
 const FAST_FALLBACK_MODEL = process.env.FAST_FALLBACK_MODEL || 'auto/best-fast'
 const AUXILIARY_TASKS = ['vision', 'web_extract', 'compression', 'skills_hub', 'approval', 'mcp', 'title_gen', 'triage_specifier', 'kanban_decomposer', 'profile_describer', 'curator']
 const SWITCHFORGE_SYSTEM = 'You are SwitchForge by DTEmpire. Be helpful and accurate. If asked your model or identity, answer SwitchForge. Never reveal or guess the upstream provider, internal route, or provider model name.'
+const roundRobinCursor = { free: 0, premium: 0 }
 
 const requiredConfig = ['GMAIL_USER', 'GMAIL_APP_PASSWORD', 'OMNIROUTE_BASE_URL', 'OMNIROUTE_API_KEY']
 if (STORAGE_BACKEND === 'r2') requiredConfig.push('R2_ENDPOINT', 'R2_BUCKET', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY')
@@ -139,15 +140,26 @@ function decryptSecret(value) {
 }
 function gatewayConfig() {
   const saved = db.settings?.gateway || {}
+  const legacyProvider = { id: 'primary', name: 'Primary provider', baseUrl: saved.baseUrl || process.env.OMNIROUTE_BASE_URL, apiKey: saved.apiKeyEncrypted ? decryptSecret(saved.apiKeyEncrypted) : process.env.OMNIROUTE_API_KEY, model: saved.freeModel || TIER_MODELS.free, premiumModel: saved.premiumModel || TIER_MODELS.premium, timeoutMs: 60000 }
+  const providers = Array.isArray(saved.providers) && saved.providers.length ? saved.providers.map(provider => ({ ...provider, apiKey: provider.apiKeyEncrypted ? decryptSecret(provider.apiKeyEncrypted) : '' })) : [legacyProvider]
+  const providerIds = providers.map(provider => provider.id)
   return {
     baseUrl: saved.baseUrl || process.env.OMNIROUTE_BASE_URL,
     apiKey: saved.apiKeyEncrypted ? decryptSecret(saved.apiKeyEncrypted) : process.env.OMNIROUTE_API_KEY,
     freeModel: saved.freeModel || TIER_MODELS.free,
     premiumModel: saved.premiumModel || TIER_MODELS.premium,
     auxiliary: Object.fromEntries(AUXILIARY_TASKS.map(task => [task, saved.auxiliary?.[task] || 'auto'])),
+    providers,
+    routes: Object.fromEntries(['free', 'premium'].map(tier => { const selected = saved.routes?.[tier]?.providerIds?.filter(id => providerIds.includes(id)); return [tier, { strategy: saved.routes?.[tier]?.strategy === 'round_robin' ? 'round_robin' : 'fallback', providerIds: selected?.length ? selected : providerIds }] })),
   }
 }
-function routeModel(tier) { const config = gatewayConfig(); return tier === 'premium' ? config.premiumModel : config.freeModel }
+function routeTargets(tier, rotate = false) {
+  const config = gatewayConfig(), route = config.routes[tier], byId = new Map(config.providers.map(provider => [provider.id, provider]))
+  let targets = route.providerIds.map(providerId => byId.get(providerId)).filter(Boolean).map(provider => ({ ...provider, model: tier === 'premium' ? (provider.premiumModel || provider.model) : provider.model }))
+  if (rotate && route.strategy === 'round_robin' && targets.length > 1) { const offset = roundRobinCursor[tier]++ % targets.length; targets = [...targets.slice(offset), ...targets.slice(0, offset)] }
+  return targets
+}
+function routeModel(tier) { return routeTargets(tier)[0]?.model || (tier === 'premium' ? gatewayConfig().premiumModel : gatewayConfig().freeModel) }
 function auxiliaryModel(task, tier) {
   if (!task || !AUXILIARY_TASKS.includes(task)) return routeModel(tier)
   const configured = gatewayConfig().auxiliary[task]
@@ -158,23 +170,32 @@ function auxiliaryModel(task, tier) {
 }
 function upstreamUrl(pathname) { return `${gatewayConfig().baseUrl.replace(/\/$/, '')}/${pathname.replace(/^\//, '')}` }
 function upstreamOptions(options) { return { ...options, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT) } }
+async function omniManagementFetch(pathname, options = {}) {
+  const config = gatewayConfig(), origin = new URL(config.baseUrl).origin
+  return fetch(`${origin}${pathname}`, { ...options, signal: AbortSignal.timeout(30000), headers: { Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json', ...options.headers }, body: options.body && typeof options.body !== 'string' ? JSON.stringify(options.body) : options.body })
+}
+async function proxyOmniJson(res, response) {
+  const data = await response.json().catch(() => ({ error: `OmniRoute returned HTTP ${response.status}` }))
+  return res.status(response.status).json(data)
+}
 async function fetchChatUpstream(payload, tier, upstreamModelOverride) {
-  const primary = upstreamModelOverride || (payload.stream && tier === 'premium' ? PREMIUM_FALLBACK_MODEL : routeModel(tier))
-  const models = tier === 'premium' && primary !== PREMIUM_FALLBACK_MODEL ? [primary, PREMIUM_FALLBACK_MODEL] : [primary]
+  let targets = routeTargets(tier, true)
+  if (!targets.length) throw new Error(`No ${tier} providers are configured`)
+  if (upstreamModelOverride) targets = [{ ...targets[0], model: upstreamModelOverride }]
   let lastError
-  for (const [index, model] of models.entries()) {
+  for (const [index, target] of targets.entries()) {
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), index === 0 && models.length > 1 ? 12000 : UPSTREAM_TIMEOUT)
+    const timeout = setTimeout(() => controller.abort(), Math.max(5000, Math.min(Number(target.timeoutMs) || 60000, UPSTREAM_TIMEOUT)))
     try {
-      const response = await fetch(upstreamUrl('/chat/completions'), {
+      const response = await fetch(`${target.baseUrl.replace(/\/$/, '')}/chat/completions`, {
         method: 'POST',
         signal: controller.signal,
-        headers: { Authorization: `Bearer ${gatewayConfig().apiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...payload, model }),
+        headers: { Authorization: `Bearer ${target.apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...payload, model: target.model }),
       })
       clearTimeout(timeout)
-      if (!response.ok && index < models.length - 1 && response.status >= 500) { await response.body?.cancel().catch(() => {}); continue }
-      return { response, resolvedModel: model }
+      if (!response.ok && index < targets.length - 1 && (response.status >= 500 || response.status === 408 || response.status === 429)) { await response.body?.cancel().catch(() => {}); continue }
+      return { response, resolvedModel: target.model, resolvedProvider: target.name }
     } catch (error) { clearTimeout(timeout); lastError = error }
   }
   throw lastError
@@ -356,7 +377,7 @@ app.put('/api/auth/password', auth, async (req, res) => {
 
 app.get('/api/admin/gateway', auth, adminOnly, (_req, res) => {
   const config = gatewayConfig(), saved = db.settings?.gateway || {}
-  res.json({ gateway: { baseUrl: config.baseUrl, freeModel: config.freeModel, premiumModel: config.premiumModel, auxiliary: config.auxiliary, apiKeyConfigured: Boolean(config.apiKey), source: saved.updatedAt ? 'admin' : 'environment', updatedAt: saved.updatedAt || null } })
+  res.json({ gateway: { baseUrl: config.baseUrl, freeModel: config.freeModel, premiumModel: config.premiumModel, auxiliary: config.auxiliary, providers: config.providers.map(({ apiKey, apiKeyEncrypted, ...provider }) => ({ ...provider, apiKeyConfigured: Boolean(apiKey) })), routes: config.routes, apiKeyConfigured: Boolean(config.apiKey), source: saved.updatedAt ? 'admin' : 'environment', updatedAt: saved.updatedAt || null } })
 })
 app.put('/api/admin/gateway', auth, adminOnly, async (req, res) => {
   const baseUrl = String(req.body.baseUrl || '').trim().replace(/\/$/, '')
@@ -366,10 +387,26 @@ app.put('/api/admin/gateway', auth, adminOnly, async (req, res) => {
   catch { return res.status(400).json({ error: { message: 'Enter a valid provider HTTP or HTTPS base URL.' } }) }
   if (!freeModel || !premiumModel || freeModel.length > 120 || premiumModel.length > 120) return res.status(400).json({ error: { message: 'Enter valid free and premium model names.' } })
   const previous = db.settings?.gateway || {}
-  db.settings ||= {}; db.settings.gateway = { ...previous, baseUrl, freeModel, premiumModel, auxiliary, updatedAt: new Date().toISOString(), updatedBy: req.user.id }
+  const previousProviders = new Map((previous.providers || []).map(provider => [provider.id, provider]))
+  const activeProviderSecrets = new Map(gatewayConfig().providers.map(provider => [provider.id, provider.apiKey]))
+  const providers = Array.isArray(req.body.providers) ? req.body.providers.slice(0, 20).map((provider, index) => {
+    const providerBaseUrl = String(provider.baseUrl || '').trim().replace(/\/$/, ''), model = String(provider.model || '').trim(), premiumProviderModel = String(provider.premiumModel || model).trim()
+    try { const parsed = new URL(providerBaseUrl); if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error() } catch { throw new Error(`Provider ${index + 1} has an invalid base URL.`) }
+    if (!model || !premiumProviderModel) throw new Error(`Provider ${index + 1} needs normal and premium model names.`)
+    const providerId = String(provider.id || id()), prior = previousProviders.get(providerId), replacementKey = String(provider.apiKey || '').trim()
+    const retainedSecret = prior?.apiKeyEncrypted || (activeProviderSecrets.get(providerId) ? encryptSecret(activeProviderSecrets.get(providerId)) : undefined)
+    return { id: providerId, name: String(provider.name || `Provider ${index + 1}`).trim().slice(0, 80), baseUrl: providerBaseUrl, model: model.slice(0, 160), premiumModel: premiumProviderModel.slice(0, 160), timeoutMs: Math.max(5000, Math.min(Number(provider.timeoutMs) || 60000, UPSTREAM_TIMEOUT)), apiKeyEncrypted: replacementKey ? encryptSecret(replacementKey) : retainedSecret }
+  }) : previous.providers
+  if (Array.isArray(providers) && providers.some(provider => !provider.apiKeyEncrypted)) return res.status(400).json({ error: { message: 'Every provider needs an API key.' } })
+  const providerIds = new Set((providers || []).map(provider => provider.id))
+  const cleanRoute = tier => ({ strategy: req.body.routes?.[tier]?.strategy === 'round_robin' ? 'round_robin' : 'fallback', providerIds: (req.body.routes?.[tier]?.providerIds || []).filter(providerId => providerIds.has(providerId)) })
+  const routes = providers?.length ? { free: cleanRoute('free'), premium: cleanRoute('premium') } : previous.routes
+  if (providers?.length && (!routes.free.providerIds.length || !routes.premium.providerIds.length)) return res.status(400).json({ error: { message: 'Assign at least one provider to both Normal and Premium routes.' } })
+  db.settings ||= {}; db.settings.gateway = { ...previous, baseUrl, freeModel, premiumModel, auxiliary, providers, routes, updatedAt: new Date().toISOString(), updatedBy: req.user.id }
   if (apiKey) db.settings.gateway.apiKeyEncrypted = encryptSecret(apiKey)
   await saveDb()
-  res.json({ gateway: { baseUrl, freeModel, premiumModel, auxiliary, apiKeyConfigured: Boolean(apiKey || previous.apiKeyEncrypted || process.env.OMNIROUTE_API_KEY), source: 'admin', updatedAt: db.settings.gateway.updatedAt } })
+  const config = gatewayConfig()
+  res.json({ gateway: { baseUrl, freeModel, premiumModel, auxiliary, providers: config.providers.map(({ apiKey: secret, apiKeyEncrypted, ...provider }) => ({ ...provider, apiKeyConfigured: Boolean(secret) })), routes: config.routes, apiKeyConfigured: Boolean(apiKey || previous.apiKeyEncrypted || process.env.OMNIROUTE_API_KEY), source: 'admin', updatedAt: db.settings.gateway.updatedAt } })
 })
 app.post('/api/admin/gateway/test', auth, adminOnly, async (req, res) => {
   try {
@@ -385,6 +422,51 @@ app.post('/api/admin/gateway/test', auth, adminOnly, async (req, res) => {
     const models = [...new Set((Array.isArray(data.data) ? data.data : []).map(model => typeof model === 'string' ? model : model?.id).filter(Boolean))].sort((a, b) => a.localeCompare(b))
     res.json({ ok: true, count: models.length, models })
   } catch { res.status(502).json({ error: { message: 'Could not connect to the provider with this URL and API key.' } }) }
+})
+
+const OAUTH_PROVIDERS = [
+  { id: 'antigravity', name: 'Google Antigravity', flow: 'browser' },
+  { id: 'gemini', name: 'Google Gemini', flow: 'browser' },
+  { id: 'claude-code', name: 'Claude Code', flow: 'device', providerKey: 'command-code' },
+  { id: 'codex', name: 'OpenAI Codex', flow: 'device', providerKey: 'codex' },
+  { id: 'copilot', name: 'GitHub Copilot', flow: 'device', providerKey: 'copilot' },
+]
+app.get('/api/admin/oauth', auth, adminOnly, async (_req, res) => {
+  try {
+    const response = await omniManagementFetch('/api/providers')
+    const data = await response.json().catch(() => ({})), items = data.providers || data.items || (Array.isArray(data) ? data : [])
+    res.json({ providers: OAUTH_PROVIDERS, connections: items.filter(item => item.authType === 'oauth' || item.authType === 'oauth2') })
+  } catch { res.status(502).json({ error: { message: 'Could not read OAuth connections from OmniRoute.' } }) }
+})
+app.post('/api/admin/oauth/:provider/start', auth, adminOnly, async (req, res) => {
+  const provider = OAUTH_PROVIDERS.find(item => item.id === req.params.provider)
+  if (!provider) return res.status(404).json({ error: { message: 'Unsupported OAuth provider.' } })
+  try {
+    if (provider.flow === 'device') return proxyOmniJson(res, await omniManagementFetch(`/api/providers/${provider.providerKey}/auth/start`, { method: 'POST' }))
+    const redirectUri = String(req.body.redirectUri || 'http://127.0.0.1:20128/callback')
+    return proxyOmniJson(res, await omniManagementFetch(`/api/oauth/${provider.id}/authorize?redirect_uri=${encodeURIComponent(redirectUri)}`))
+  } catch { res.status(502).json({ error: { message: 'Could not start OAuth authorization.' } }) }
+})
+app.post('/api/admin/oauth/:provider/exchange', auth, adminOnly, async (req, res) => {
+  const provider = OAUTH_PROVIDERS.find(item => item.id === req.params.provider && item.flow === 'browser')
+  if (!provider) return res.status(400).json({ error: { message: 'This provider does not use callback exchange.' } })
+  const pasted = String(req.body.callback || '').trim(); let code, state = req.body.state
+  try { const parsed = new URL(pasted); code = parsed.searchParams.get('code'); state = parsed.searchParams.get('state') || parsed.hash.replace(/^#/, '') || state } catch { [code, state = state] = pasted.split('#', 2) }
+  if (!code) return res.status(400).json({ error: { message: 'Paste the complete callback URL or code#state.' } })
+  try { return proxyOmniJson(res, await omniManagementFetch(`/api/oauth/${provider.id}/exchange`, { method: 'POST', body: { code, state, redirectUri: req.body.redirectUri, codeVerifier: req.body.codeVerifier } })) }
+  catch { res.status(502).json({ error: { message: 'OAuth code exchange failed.' } }) }
+})
+app.get('/api/admin/oauth/:provider/status', auth, adminOnly, async (req, res) => {
+  const provider = OAUTH_PROVIDERS.find(item => item.id === req.params.provider && item.flow === 'device')
+  if (!provider) return res.status(400).json({ error: { message: 'Unsupported device flow.' } })
+  try { return proxyOmniJson(res, await omniManagementFetch(`/api/providers/${provider.providerKey}/auth/status?state=${encodeURIComponent(String(req.query.state || ''))}`)) }
+  catch { res.status(502).json({ error: { message: 'Could not check authorization status.' } }) }
+})
+app.post('/api/admin/oauth/:provider/apply', auth, adminOnly, async (req, res) => {
+  const provider = OAUTH_PROVIDERS.find(item => item.id === req.params.provider && item.flow === 'device')
+  if (!provider) return res.status(400).json({ error: { message: 'Unsupported device flow.' } })
+  try { return proxyOmniJson(res, await omniManagementFetch(`/api/providers/${provider.providerKey}/auth/apply`, { method: 'POST', body: { state: req.body.state } })) }
+  catch { res.status(502).json({ error: { message: 'Could not apply authorized connection.' } }) }
 })
 
 app.get('/api/admin/users', auth, adminOnly, (_req, res) => {
@@ -453,8 +535,10 @@ app.get('/api/usage', auth, (req, res) => {
   for (let offset = 29; offset >= 0; offset -= 1) { const date = new Date(Date.now() - offset * 86400000).toISOString().slice(0, 10); dailyMap.set(date, { date, requests: 0, tokens: 0 }) }
   for (const event of recentEvents) { const day = event.createdAt.slice(0, 10), entry = dailyMap.get(day); if (entry) { entry.requests += 1; entry.tokens += Number(event.tokens || 0) } }
   const keyNames = new Map(userKeys.map(key => [key.id, key.name]))
+  const successfulRequests = events.filter(event => event.success !== false).length
+  const latencySamples = events.map(event => Number(event.latencyMs)).filter(Number.isFinite)
   res.json({
-    summary: { requests: events.length, tokens: events.reduce((sum, event) => sum + Number(event.tokens || 0), 0), freeRequests: events.filter(event => event.tier === 'free').length, premiumRequests: events.filter(event => event.tier === 'premium').length },
+    summary: { requests: events.length, tokens: events.reduce((sum, event) => sum + Number(event.tokens || 0), 0), freeRequests: events.filter(event => event.tier === 'free').length, premiumRequests: events.filter(event => event.tier === 'premium').length, successRate: events.length ? (successfulRequests / events.length) * 100 : null, averageLatencyMs: latencySamples.length ? Math.round(latencySamples.reduce((sum, value) => sum + value, 0) / latencySamples.length) : null, latencySamples: latencySamples.length },
     daily: [...dailyMap.values()],
     keys: userKeys.map(key => ({ ...keyView(key), requests: events.filter(event => event.keyId === key.id).length })),
     recent: events.slice(0, 20).map(event => ({ ...event, keyName: keyNames.get(event.keyId) || 'Deleted key' })),
@@ -495,6 +579,13 @@ app.get('/v1/models/:model', customerKey, (req, res) => {
 })
 app.get('/v1/usage', customerKey, (req, res) => res.json({ token_used: req.apiKey.tokenUsed, token_limit: req.apiKey.tokenLimit ?? null, remaining: req.apiKey.tokenLimit == null ? null : Math.max(0, req.apiKey.tokenLimit - req.apiKey.tokenUsed), expires_at: req.apiKey.expiresAt || null }))
 app.post('/v1/chat/completions', customerKey, async (req, res) => {
+  const startedAt = Date.now()
+  let usageRecorded = false
+  const recordUsage = ({ tier = 'unknown', model = null, tokens = 0, success }) => {
+    if (usageRecorded) return
+    usageRecorded = true
+    db.usage.push({ id: id(), keyId: req.apiKey.id, tier, model, tokens, success, latencyMs: Date.now() - startedAt, createdAt: new Date().toISOString() })
+  }
   try {
     if (!Array.isArray(req.body.messages) || req.body.messages.length === 0) return res.status(400).json({ error: { message: 'messages must be a non-empty array.', type: 'invalid_request_error' } })
     const requestedTier = String(req.body.tier || req.headers['x-dtempire-tier'] || 'auto').toLowerCase()
@@ -512,28 +603,30 @@ app.post('/v1/chat/completions', customerKey, async (req, res) => {
     if (req.apiKey.tokenLimit != null && req.apiKey.tokenUsed + estimatedRequest > req.apiKey.tokenLimit) return res.status(429).json({ error: { message: 'This request may exceed the remaining token allowance.', type: 'rate_limit_error', code: 'token_limit_exceeded' } })
     console.log(`SwitchForge route tier=${tier} model=${upstreamModelOverride || routeModel(tier)} task=${task || 'main'} stream=${Boolean(payload.stream)}`)
     let { response: upstream, resolvedModel } = await fetchChatUpstream(payload, tier, upstreamModelOverride)
-    if (!upstream.ok) { const body = await upstream.text(); res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(body); return }
+    if (!upstream.ok) { const body = await upstream.text(); recordUsage({ tier, model: resolvedModel, success: false }); await saveDb(); res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(body); return }
     if (payload.stream) {
       let prepared
       try { prepared = await prepareStream(upstream, tier === 'free' && !upstreamModelOverride ? 7000 : 18000) }
       catch (error) {
         if (tier !== 'free' || upstreamModelOverride || resolvedModel === FAST_FALLBACK_MODEL) throw error
         const fallback = await fetchChatUpstream(payload, tier, FAST_FALLBACK_MODEL); upstream = fallback.response; resolvedModel = fallback.resolvedModel
-        if (!upstream.ok) { const body = await upstream.text(); res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(body); return }
+        if (!upstream.ok) { const body = await upstream.text(); recordUsage({ tier, model: resolvedModel, success: false }); await saveDb(); res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(body); return }
         prepared = await prepareStream(upstream, 18000)
       }
       res.status(200); res.setHeader('Content-Type', upstream.headers.get('content-type') || 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', resolvedModel); if (task) res.setHeader('X-SwitchForge-Task', task)
       const reader = prepared.reader; let completionText = prepared.text
       for (const chunk of prepared.chunks) res.write(chunk)
-      if (prepared.done) { const estimated = estimateTokens(payload.messages) + estimateTokens(completionText); req.apiKey.tokenUsed += estimated; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, model: resolvedModel, tokens: estimated, createdAt: new Date().toISOString() }); res.end(); saveDb().catch(console.error); return }
+      if (prepared.done) { const estimated = estimateTokens(payload.messages) + estimateTokens(completionText); req.apiKey.tokenUsed += estimated; recordUsage({ tier, model: resolvedModel, tokens: estimated, success: true }); res.end(); saveDb().catch(console.error); return }
       while (true) { const { done, value } = await reader.read(); if (done) break; const chunk = Buffer.from(value); completionText += chunk.toString('utf8'); res.write(chunk) }
-      const estimated = estimateTokens(payload.messages) + estimateTokens(completionText); req.apiKey.tokenUsed += estimated; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, model: resolvedModel, tokens: estimated, createdAt: new Date().toISOString() }); res.end(); saveDb().catch(console.error); return
+      const estimated = estimateTokens(payload.messages) + estimateTokens(completionText); req.apiKey.tokenUsed += estimated; recordUsage({ tier, model: resolvedModel, tokens: estimated, success: true }); res.end(); saveDb().catch(console.error); return
     }
     const data = await readChatResponse(upstream), used = Number(data.usage?.total_tokens || estimateTokens(payload.messages) + estimateTokens(data.choices?.[0]?.message?.content || ''))
-    req.apiKey.tokenUsed += used; db.usage.push({ id: id(), keyId: req.apiKey.id, tier, model: resolvedModel, tokens: used, createdAt: new Date().toISOString() })
+    req.apiKey.tokenUsed += used; recordUsage({ tier, model: resolvedModel, tokens: used, success: true })
     data.model = PUBLIC_MODEL; data.switchforge = { tier, model: resolvedModel, requested_tier: requestedTier, premium_access: premiumAllowed, task: task || null }; data.dtempire = data.switchforge; res.setHeader('X-DTEmpire-Tier', tier); res.setHeader('X-SwitchForge-Route-Model', resolvedModel); if (task) res.setHeader('X-SwitchForge-Task', task); res.json(data); saveDb().catch(console.error)
   } catch (error) {
     console.error(error)
+    recordUsage({ success: false })
+    saveDb().catch(console.error)
     if (!res.headersSent) res.status(502).json({ error: { message: 'The configured model provider is unavailable.', type: 'upstream_error' } })
     else if (!res.writableEnded) { res.write(`data: ${JSON.stringify({ error: { message: 'The upstream stream ended unexpectedly.', type: 'upstream_error' } })}\n\ndata: [DONE]\n\n`); res.end() }
   }
