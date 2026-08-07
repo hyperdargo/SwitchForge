@@ -435,7 +435,10 @@ app.get('/api/admin/oauth', auth, adminOnly, async (_req, res) => {
   try {
     const response = await omniManagementFetch('/api/providers')
     const data = await response.json().catch(() => ({})), items = data.providers || data.items || (Array.isArray(data) ? data : [])
-    res.json({ providers: OAUTH_PROVIDERS, connections: items.filter(item => item.authType === 'oauth' || item.authType === 'oauth2') })
+    const localConnections = (gatewayConfig().providers || []).filter(provider => provider.id?.startsWith('oauth-')).map(provider => ({ id: provider.id, provider: provider.connection || provider.id.slice(6), name: provider.name, authType: 'oauth', isActive: true }))
+    const remoteConnections = items.filter(item => item.authType === 'oauth' || item.authType === 'oauth2' || ['antigravity', 'gemini', 'claude', 'claude-code', 'codex', 'copilot'].includes(String(item.provider || item.id || '').toLowerCase()))
+    const byId = new Map([...remoteConnections, ...localConnections].map(item => [item.id || item.provider, item]))
+    res.set('Cache-Control', 'no-store').json({ providers: OAUTH_PROVIDERS, connections: [...byId.values()] })
   } catch { res.status(502).json({ error: { message: 'Could not read OAuth connections from OmniRoute.' } }) }
 })
 app.post('/api/admin/oauth/:provider/start', auth, adminOnly, async (req, res) => {

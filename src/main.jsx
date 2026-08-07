@@ -1112,11 +1112,14 @@ function AdminPanel({ onClose, initialTab = "gateway" }) {
     setMessage("OAuth authorization timed out.");
   };
   const exchangeOauth = async () => {
+    setBusy(true);
+    setMessage("Completing OAuth connection...");
     try {
       await api(`/admin/oauth/${oauthFlow.provider.id}/exchange`, { method: "POST", body: JSON.stringify({ callback: oauthCallback, state: oauthFlow.state, redirectUri: oauthFlow.redirectUri, codeVerifier: oauthFlow.codeVerifier }) });
       await api(`/admin/oauth/${oauthFlow.provider.id}/register`, { method: "POST", body: JSON.stringify({}) });
       setMessage(`${oauthFlow.provider.name} connected and added to the provider router.`); setOauthFlow(null); setOauthCallback(""); await Promise.all([refreshOauth(), refreshGateway()]);
     } catch (err) { setMessage(err.message); }
+    finally { setBusy(false); }
   };
   return (
     <div className="modal-bg admin-bg">
@@ -1271,7 +1274,7 @@ function AdminPanel({ onClose, initialTab = "gateway" }) {
                     return authorizationUrl ? <><p>Open this authorization link in any browser or account profile:</p><div className="oauth-link"><code>{authorizationUrl}</code><a href={authorizationUrl} target="_blank" rel="noreferrer"><ArrowRight />Open link</a><button onClick={() => { navigator.clipboard?.writeText(authorizationUrl); setMessage("Authorization link copied."); }}><Copy />Copy link</button></div></> : null;
                   })()}
                   {(oauthFlow.userCode || oauthFlow.user_code) && <p>Enter code <code>{oauthFlow.userCode || oauthFlow.user_code}</code> in the opened page.</p>}
-                  {oauthFlow.provider.flow === "browser" && <><p>After approval, paste the complete callback URL or <code>code#state</code>.</p><textarea value={oauthCallback} onChange={(e) => setOauthCallback(e.target.value)} placeholder="http://127.0.0.1:20128/callback?code=...&state=..." /><button className="primary-btn" disabled={!oauthCallback.trim()} onClick={exchangeOauth}>Complete connection</button></>}
+                  {oauthFlow.provider.flow === "browser" && <><p>After approval, paste the complete callback URL or <code>code#state</code>.</p><textarea value={oauthCallback} onChange={(e) => setOauthCallback(e.target.value)} placeholder="http://127.0.0.1:20128/callback?code=...&state=..." /><button className="primary-btn" disabled={busy || !oauthCallback.trim()} onClick={exchangeOauth}>{busy ? "Connecting..." : "Complete connection"}</button></>}
                 </div>
               )}
               <p className="oauth-count">{oauth.connections.length} active OAuth connection{oauth.connections.length === 1 ? "" : "s"} in OmniRoute.</p>
