@@ -1092,8 +1092,6 @@ function AdminPanel({ onClose, initialTab = "gateway" }) {
       const data = await api(`/admin/oauth/${provider.id}/start`, { method: "POST", body: JSON.stringify({}) });
       const flow = { ...data, provider };
       setOauthFlow(flow);
-      const target = data.authUrl || data.authorizeUrl || data.verificationUri || data.verification_uri_complete || data.verification_uri;
-      if (target) window.open(target, "switchforge_oauth", "noopener,noreferrer");
       if (provider.flow === "device" && data.state) pollOauth(provider, data.state);
     } catch (err) { setMessage(err.message); } finally { setBusy(false); }
   };
@@ -1265,6 +1263,10 @@ function AdminPanel({ onClose, initialTab = "gateway" }) {
               {oauthFlow && (
                 <div className="oauth-flow">
                   <b>Connect {oauthFlow.provider.name}</b>
+                  {(() => {
+                    const authorizationUrl = oauthFlow.authUrl || oauthFlow.authorizeUrl || oauthFlow.verificationUri || oauthFlow.verification_uri_complete || oauthFlow.verification_uri;
+                    return authorizationUrl ? <><p>Open this authorization link in any browser or account profile:</p><div className="oauth-link"><code>{authorizationUrl}</code><a href={authorizationUrl} target="_blank" rel="noreferrer"><ArrowRight />Open link</a><button onClick={() => { navigator.clipboard?.writeText(authorizationUrl); setMessage("Authorization link copied."); }}><Copy />Copy link</button></div></> : null;
+                  })()}
                   {(oauthFlow.userCode || oauthFlow.user_code) && <p>Enter code <code>{oauthFlow.userCode || oauthFlow.user_code}</code> in the opened page.</p>}
                   {oauthFlow.provider.flow === "browser" && <><p>After approval, paste the complete callback URL or <code>code#state</code>.</p><textarea value={oauthCallback} onChange={(e) => setOauthCallback(e.target.value)} placeholder="http://127.0.0.1:20128/callback?code=...&state=..." /><button className="primary-btn" disabled={!oauthCallback.trim()} onClick={exchangeOauth}>Complete connection</button></>}
                 </div>
