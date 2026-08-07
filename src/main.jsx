@@ -1194,7 +1194,7 @@ function AdminPanel({ onClose, initialTab = "gateway" }) {
               </button>
               <span>
                 {models.length
-                  ? `${models.length} models available`
+                  ? `${models.length} models across ${new Set(models.map((model) => model.split("/")[0])).size} provider groups`
                   : "Load models before choosing routes."}
               </span>
             </div>
@@ -1239,12 +1239,12 @@ function AdminPanel({ onClose, initialTab = "gateway" }) {
             <div className="provider-list">
               {config.providers.map((provider, index) => (
                 <div className="provider-card" key={provider.id}>
-                  <div className="provider-card-head"><b>{index + 1}. {provider.name || "Provider"}</b><button disabled={config.providers.length === 1} onClick={() => removeProvider(provider.id)} title="Remove provider"><Trash2 /></button></div>
+                  <div className="provider-card-head"><span><b>{index + 1}. {provider.name || "Provider"}</b><small>{provider.source ? `${provider.source}${provider.connection ? ` · ${provider.connection}` : ""}` : "Custom OpenAI-compatible provider"}</small></span><button disabled={config.providers.length === 1} onClick={() => removeProvider(provider.id)} title="Remove provider"><Trash2 /></button></div>
                   <div className="provider-grid">
                     <label>Name<input value={provider.name} onChange={(e) => updateProvider(provider.id, "name", e.target.value)} /></label>
                     <label>Base URL<input value={provider.baseUrl} onChange={(e) => updateProvider(provider.id, "baseUrl", e.target.value)} placeholder="https://website.com/v1" /></label>
-                    <label>Normal model<input value={provider.model} onChange={(e) => updateProvider(provider.id, "model", e.target.value)} /></label>
-                    <label>Premium model<input value={provider.premiumModel || ""} onChange={(e) => updateProvider(provider.id, "premiumModel", e.target.value)} /></label>
+                    <label>Normal model<input list="gateway-models" value={provider.model} onChange={(e) => updateProvider(provider.id, "model", e.target.value)} /></label>
+                    <label>Premium model<input list="gateway-models" value={provider.premiumModel || ""} onChange={(e) => updateProvider(provider.id, "premiumModel", e.target.value)} /></label>
                     <label>API key<input type="password" value={provider.apiKey || ""} onChange={(e) => updateProvider(provider.id, "apiKey", e.target.value)} placeholder={provider.apiKeyConfigured ? "Saved — leave blank to keep" : "Required"} /></label>
                     <label>Timeout (ms)<input type="number" min="5000" max="180000" step="1000" value={provider.timeoutMs || 60000} onChange={(e) => updateProvider(provider.id, "timeoutMs", Number(e.target.value))} /></label>
                   </div>

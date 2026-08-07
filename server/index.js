@@ -141,7 +141,7 @@ function decryptSecret(value) {
 function gatewayConfig() {
   const saved = db.settings?.gateway || {}
   const legacyProvider = { id: 'primary', name: 'Primary provider', baseUrl: saved.baseUrl || process.env.OMNIROUTE_BASE_URL, apiKey: saved.apiKeyEncrypted ? decryptSecret(saved.apiKeyEncrypted) : process.env.OMNIROUTE_API_KEY, model: saved.freeModel || TIER_MODELS.free, premiumModel: saved.premiumModel || TIER_MODELS.premium, timeoutMs: 60000 }
-  const providers = Array.isArray(saved.providers) && saved.providers.length ? saved.providers.map(provider => ({ ...provider, apiKey: provider.apiKeyEncrypted ? decryptSecret(provider.apiKeyEncrypted) : '' })) : [legacyProvider]
+  const providers = Array.isArray(saved.providers) && saved.providers.length ? saved.providers.map(provider => ({ ...provider, ...(provider.id?.startsWith('oauth-') ? { source: provider.source || 'OmniRoute', connection: provider.connection || provider.id.slice(6), name: provider.name?.startsWith('OmniRoute /') ? provider.name : `OmniRoute / ${provider.name}` } : {}), apiKey: provider.apiKeyEncrypted ? decryptSecret(provider.apiKeyEncrypted) : '' })) : [legacyProvider]
   const providerIds = providers.map(provider => provider.id)
   return {
     baseUrl: saved.baseUrl || process.env.OMNIROUTE_BASE_URL,
@@ -461,7 +461,7 @@ app.post('/api/admin/oauth/:provider/register', auth, adminOnly, async (req, res
   const [name, model] = defaults[req.params.provider] || []
   if (!name) return res.status(400).json({ error: { message: 'Unsupported OAuth provider.' } })
   const config = gatewayConfig(), saved = db.settings?.gateway || {}, providers = Array.isArray(saved.providers) && saved.providers.length ? [...saved.providers] : config.providers.map(provider => ({ ...provider, apiKeyEncrypted: provider.apiKey ? encryptSecret(provider.apiKey) : undefined }))
-  const providerId = `oauth-${req.params.provider}`, existing = providers.findIndex(provider => provider.id === providerId), entry = { id: providerId, name, baseUrl: config.baseUrl, model, premiumModel: model, timeoutMs: 60000, apiKeyEncrypted: config.apiKey ? encryptSecret(config.apiKey) : undefined }
+  const providerId = `oauth-${req.params.provider}`, existing = providers.findIndex(provider => provider.id === providerId), entry = { id: providerId, name: `OmniRoute / ${name}`, source: 'OmniRoute', connection: req.params.provider, baseUrl: config.baseUrl, model, premiumModel: model, timeoutMs: 60000, apiKeyEncrypted: config.apiKey ? encryptSecret(config.apiKey) : undefined }
   if (existing >= 0) providers[existing] = { ...providers[existing], ...entry }; else providers.push(entry)
   const ids = new Set(providers.map(provider => provider.id)), priorRoutes = config.routes
   const routes = { free: { strategy: priorRoutes.free.strategy, providerIds: [...new Set([...priorRoutes.free.providerIds, providerId])].filter(id => ids.has(id)) }, premium: { strategy: priorRoutes.premium.strategy, providerIds: [...new Set([...priorRoutes.premium.providerIds, providerId])].filter(id => ids.has(id)) } }
